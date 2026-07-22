@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+	<string>ATEM CNTRL</string>
+    <key>CFBundleExecutable</key>
+	<string>ATEMCNTRL</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.local.atem-edit</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+	<string>ATEM CNTRL</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+	<string>0.3.1</string>
+    <key>CFBundleVersion</key>
+	<string>6</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+	<string>ATEM CNTRL connects directly to Blackmagic Design ATEM switchers on your local network.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_blackmagic._tcp</string>
+        <string>_switcher_ctrl._udp</string>
+    </array>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+</dict>
+</plist>
