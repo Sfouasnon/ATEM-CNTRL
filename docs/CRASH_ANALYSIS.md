@@ -26,16 +26,19 @@ The final sampled main-thread path through `Terminate()` reflects the user/syste
 
 ## Design response in ATEM CNTRL
 
-- Do not query or initialize `IBMDSwitcherCameraControl`.
+- Never query or initialize `IBMDSwitcherCameraControl` in the main application process.
 - Never call `ConnectTo()`, a getter, or a setter on AppKit's main thread.
 - Serialize all API activity on one dedicated queue per switcher session to avoid concurrent access to an interface graph.
 - Send immutable state snapshots to the main thread for display.
 - Keep the window responsive even if a Blackmagic API call is slow.
 - Use periodic state refresh as a fallback in addition to SDK callbacks.
 - Provide an offline Demo mode and runtime self-test.
+- Launch camera/color control only on explicit user request in `ATEMCameraHelper`, a separate process with its own discovery object, ATEM connection, and camera-control interface graph.
+- Send helper commands through bounded, coalesced asynchronous IPC; never write to the helper pipe from AppKit, and keep only one command outstanding until its reply.
+- Stop the helper on session/address changes or disconnect, apply an eight-second startup watchdog and three-second command watchdog, and escalate from termination to forced kill if its SDK thread cannot exit.
 
 ## What remains uncertain
 
 The hang report proves where the process stopped, but a stack sample alone cannot identify the precise kernel descriptor or Blackmagic source-code defect. The causal explanation is therefore an inference from the blocking `write()` and lock ownership—not a source-level proof.
 
-ATEM CNTRL still uses Blackmagic's installed API bundle for core switching. The current evidence suggests avoiding camera initialization is sufficient, but only a Tahoe 26.5.2 hardware test can confirm that the rest of the runtime is stable.
+ATEM CNTRL still uses Blackmagic's installed API bundle for core switching, Fairlight audio, and ATEM-managed HyperDeck control. Camera control remains capable of hanging inside its helper, but that failure is contained by process isolation. Only a Tahoe 26.5.2 hardware test can confirm that the main process stays stable and that force-stopping the helper releases every affected ATEM/runtime resource.

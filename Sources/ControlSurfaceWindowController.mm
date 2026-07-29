@@ -391,8 +391,10 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
 @property(nonatomic, copy) NSString *multiviewSignature;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSPopUpButton *> *multiviewLayoutPopups;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSArray<ATEMControlButton *> *> *multiviewQuadrantButtons;
-@property(nonatomic, strong) NSMutableArray<ATEMControlButton *> *multiviewSwapButtons;
-@property(nonatomic, strong) NSMutableArray<NSSlider *> *multiviewOpacitySliders;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, ATEMControlButton *> *multiviewSwapButtons;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSSlider *> *multiviewOpacitySliders;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, ATEMControlButton *> *multiviewAllLabelButtons;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, ATEMControlButton *> *multiviewAllBorderButtons;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSPopUpButton *> *multiviewSourcePopups;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSButton *> *multiviewVUButtons;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSButton *> *multiviewSafeButtons;
@@ -443,8 +445,10 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
         _auxPopups = [NSMutableArray array];
         _multiviewLayoutPopups = [NSMutableDictionary dictionary];
         _multiviewQuadrantButtons = [NSMutableDictionary dictionary];
-        _multiviewSwapButtons = [NSMutableArray array];
-        _multiviewOpacitySliders = [NSMutableArray array];
+        _multiviewSwapButtons = [NSMutableDictionary dictionary];
+        _multiviewOpacitySliders = [NSMutableDictionary dictionary];
+        _multiviewAllLabelButtons = [NSMutableDictionary dictionary];
+        _multiviewAllBorderButtons = [NSMutableDictionary dictionary];
         _multiviewSourcePopups = [NSMutableDictionary dictionary];
         _multiviewVUButtons = [NSMutableDictionary dictionary];
         _multiviewSafeButtons = [NSMutableDictionary dictionary];
@@ -769,6 +773,31 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
     self.statusLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
     [header addSubview:self.statusLabel];
 
+    ATEMControlButton *audioButton = [[ATEMControlButton alloc] initWithTitle:@"AUDIO"
+                                                                      target:self
+                                                                      action:@selector(featurePressed:)];
+    audioButton.tag = 0;
+    audioButton.activeColor = ThemeCyan();
+    audioButton.fillsWhenActive = NO;
+    audioButton.toolTip = @"Open the dedicated Fairlight audio mixer window.";
+    [header addSubview:audioButton];
+    ATEMControlButton *colorButton = [[ATEMControlButton alloc] initWithTitle:@"COLOR"
+                                                                      target:self
+                                                                      action:@selector(featurePressed:)];
+    colorButton.tag = 1;
+    colorButton.activeColor = ThemeViolet();
+    colorButton.fillsWhenActive = NO;
+    colorButton.toolTip = @"Open isolated camera color control.";
+    [header addSubview:colorButton];
+    ATEMControlButton *hyperDeckButton = [[ATEMControlButton alloc] initWithTitle:@"HYPERDECK"
+                                                                          target:self
+                                                                          action:@selector(featurePressed:)];
+    hyperDeckButton.tag = 2;
+    hyperDeckButton.activeColor = ThemeAmber();
+    hyperDeckButton.fillsWhenActive = NO;
+    hyperDeckButton.toolTip = @"Configure and control HyperDecks through the active ATEM.";
+    [header addSubview:hyperDeckButton];
+
     [NSLayoutConstraint activateConstraints:@[
         [brandLogo.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:18],
         [brandLogo.topAnchor constraintEqualToAnchor:header.topAnchor constant:10],
@@ -814,8 +843,21 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
         [statusPrefix.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:22],
         [statusPrefix.bottomAnchor constraintEqualToAnchor:header.bottomAnchor constant:-9],
         [self.statusLabel.leadingAnchor constraintEqualToAnchor:statusPrefix.trailingAnchor constant:10],
-        [self.statusLabel.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-22],
+        [self.statusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:audioButton.leadingAnchor constant:-14],
         [self.statusLabel.centerYAnchor constraintEqualToAnchor:statusPrefix.centerYAnchor],
+
+        [hyperDeckButton.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-20],
+        [hyperDeckButton.bottomAnchor constraintEqualToAnchor:header.bottomAnchor constant:-5],
+        [hyperDeckButton.widthAnchor constraintEqualToConstant:104],
+        [hyperDeckButton.heightAnchor constraintEqualToConstant:25],
+        [colorButton.trailingAnchor constraintEqualToAnchor:hyperDeckButton.leadingAnchor constant:-7],
+        [colorButton.bottomAnchor constraintEqualToAnchor:hyperDeckButton.bottomAnchor],
+        [colorButton.widthAnchor constraintEqualToConstant:76],
+        [colorButton.heightAnchor constraintEqualToAnchor:hyperDeckButton.heightAnchor],
+        [audioButton.trailingAnchor constraintEqualToAnchor:colorButton.leadingAnchor constant:-7],
+        [audioButton.bottomAnchor constraintEqualToAnchor:hyperDeckButton.bottomAnchor],
+        [audioButton.widthAnchor constraintEqualToConstant:76],
+        [audioButton.heightAnchor constraintEqualToAnchor:hyperDeckButton.heightAnchor],
     ]];
     return header;
 }
@@ -1065,6 +1107,7 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
 - (NSView *)smallCheckboxGroupWithTitle:(NSString *)title
                                  action:(SEL)action
                                     tag:(NSInteger)tag
+                    displayWindowNumber:(NSUInteger)displayWindowNumber
                                  button:(NSButton * __strong *)buttonOut
 {
     NSStackView *group = [[NSStackView alloc] initWithFrame:NSZeroRect];
@@ -1083,7 +1126,7 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
     button.contentTintColor = ThemeCyan();
     button.accessibilityLabel = [NSString stringWithFormat:@"Multiview %lu Window %lu %@",
                                  (unsigned long)MultiviewIndexFromTag(tag) + 1,
-                                 (unsigned long)MultiviewWindowFromTag(tag) + 1,
+                                 (unsigned long)displayWindowNumber,
                                  title.capitalizedString];
     [group addArrangedSubview:button];
     if (buttonOut)
@@ -1174,6 +1217,8 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
     [self.multiviewQuadrantButtons removeAllObjects];
     [self.multiviewSwapButtons removeAllObjects];
     [self.multiviewOpacitySliders removeAllObjects];
+    [self.multiviewAllLabelButtons removeAllObjects];
+    [self.multiviewAllBorderButtons removeAllObjects];
     [self.multiviewSourcePopups removeAllObjects];
     [self.multiviewVUButtons removeAllObjects];
     [self.multiviewSafeButtons removeAllObjects];
@@ -1275,7 +1320,33 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
                                    (unsigned long)multiview.index + 1];
         [header addArrangedSubview:swap];
         [swap.widthAnchor constraintEqualToConstant:132].active = YES;
-        [self.multiviewSwapButtons addObject:swap];
+        self.multiviewSwapButtons[@(multiview.index)] = swap;
+
+        ATEMControlButton *allLabels = [[ATEMControlButton alloc] initWithTitle:@"LABELS ON"
+                                                                        target:self
+                                                                        action:@selector(multiviewAllLabelsPressed:)];
+        allLabels.tag = multiview.index;
+        allLabels.activeColor = ThemeViolet();
+        allLabels.fillsWhenActive = NO;
+        allLabels.accessibilityLabel = [NSString stringWithFormat:@"Multiview %lu all labels",
+                                       (unsigned long)multiview.index + 1];
+        allLabels.toolTip = @"Turn labels on for every supported window, or turn them all off.";
+        [header addArrangedSubview:allLabels];
+        [allLabels.widthAnchor constraintEqualToConstant:102].active = YES;
+        self.multiviewAllLabelButtons[@(multiview.index)] = allLabels;
+
+        ATEMControlButton *allBorders = [[ATEMControlButton alloc] initWithTitle:@"BORDERS ON"
+                                                                         target:self
+                                                                         action:@selector(multiviewAllBordersPressed:)];
+        allBorders.tag = multiview.index;
+        allBorders.activeColor = ThemeViolet();
+        allBorders.fillsWhenActive = NO;
+        allBorders.accessibilityLabel = [NSString stringWithFormat:@"Multiview %lu all borders",
+                                        (unsigned long)multiview.index + 1];
+        allBorders.toolTip = @"Turn borders on for every window, or turn them all off.";
+        [header addArrangedSubview:allBorders];
+        [allBorders.widthAnchor constraintEqualToConstant:108].active = YES;
+        self.multiviewAllBorderButtons[@(multiview.index)] = allBorders;
 
         NSView *spacer = [[NSView alloc] initWithFrame:NSZeroRect];
         [spacer setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
@@ -1292,7 +1363,7 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
         opacity.toolTip = @"Multiview audio-meter opacity";
         [header addArrangedSubview:opacity];
         [opacity.widthAnchor constraintEqualToConstant:125].active = YES;
-        [self.multiviewOpacitySliders addObject:opacity];
+        self.multiviewOpacitySliders[@(multiview.index)] = opacity;
         [sectionStack addArrangedSubview:header];
         [header.widthAnchor constraintEqualToAnchor:sectionStack.widthAnchor].active = YES;
         [header.heightAnchor constraintEqualToConstant:34].active = YES;
@@ -1325,7 +1396,11 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
                 tile.layer.borderColor = ThemeDivider().CGColor;
                 tile.layer.borderWidth = 1;
 
-                NSTextField *windowLabel = Label([NSString stringWithFormat:@"WINDOW %lu", (unsigned long)window.index + 1], 9, NSFontWeightSemibold, ThemeSecondary());
+                NSUInteger displayWindowNumber = windowIndex + 1;
+                NSTextField *windowLabel =
+                    Label([NSString stringWithFormat:@"WINDOW %lu",
+                           (unsigned long)displayWindowNumber],
+                          9, NSFontWeightSemibold, ThemeSecondary());
                 [tile addArrangedSubview:windowLabel];
                 NSPopUpButton *sourcePopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
                 sourcePopup.tag = controlTag;
@@ -1334,7 +1409,7 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
                 StylePopup(sourcePopup);
                 sourcePopup.accessibilityLabel = [NSString stringWithFormat:@"Multiview %lu Window %lu source",
                                                   (unsigned long)multiview.index + 1,
-                                                  (unsigned long)window.index + 1];
+                                                  (unsigned long)displayWindowNumber];
                 for (ATEMInputState *input in inputs) {
                     BOOL available = multiview.inputAvailabilityMask != 0 &&
                         (input.availabilityMask & multiview.inputAvailabilityMask) == multiview.inputAvailabilityMask;
@@ -1357,10 +1432,26 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
                 NSButton *safe = nil;
                 NSButton *label = nil;
                 NSButton *border = nil;
-                [options addArrangedSubview:[self smallCheckboxGroupWithTitle:@"VU" action:@selector(multiviewVUToggled:) tag:controlTag button:&vu]];
-                [options addArrangedSubview:[self smallCheckboxGroupWithTitle:@"SAFE" action:@selector(multiviewSafeToggled:) tag:controlTag button:&safe]];
-                [options addArrangedSubview:[self smallCheckboxGroupWithTitle:@"LABEL" action:@selector(multiviewLabelToggled:) tag:controlTag button:&label]];
-                [options addArrangedSubview:[self smallCheckboxGroupWithTitle:@"BORDER" action:@selector(multiviewBorderToggled:) tag:controlTag button:&border]];
+                [options addArrangedSubview:[self smallCheckboxGroupWithTitle:@"VU"
+                                                                       action:@selector(multiviewVUToggled:)
+                                                                          tag:controlTag
+                                                          displayWindowNumber:displayWindowNumber
+                                                                       button:&vu]];
+                [options addArrangedSubview:[self smallCheckboxGroupWithTitle:@"SAFE"
+                                                                       action:@selector(multiviewSafeToggled:)
+                                                                          tag:controlTag
+                                                          displayWindowNumber:displayWindowNumber
+                                                                       button:&safe]];
+                [options addArrangedSubview:[self smallCheckboxGroupWithTitle:@"LABEL"
+                                                                       action:@selector(multiviewLabelToggled:)
+                                                                          tag:controlTag
+                                                          displayWindowNumber:displayWindowNumber
+                                                                       button:&label]];
+                [options addArrangedSubview:[self smallCheckboxGroupWithTitle:@"BORDER"
+                                                                       action:@selector(multiviewBorderToggled:)
+                                                                          tag:controlTag
+                                                          displayWindowNumber:displayWindowNumber
+                                                                       button:&border]];
                 [tile addArrangedSubview:options];
                 [options.widthAnchor constraintEqualToAnchor:tile.widthAnchor constant:-16].active = YES;
                 self.multiviewVUButtons[controlKey] = vu;
@@ -1680,16 +1771,44 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
             button.enabled = state.isConnected && multiview.canChangeLayout;
             button.accessibilityValue = split ? @"Four small windows" : @"One large window";
         }
-        if (multiview.index < self.multiviewSwapButtons.count) {
-            ATEMControlButton *swap = self.multiviewSwapButtons[multiview.index];
+        ATEMControlButton *swap = self.multiviewSwapButtons[@(multiview.index)];
+        if (swap) {
             swap.active = multiview.isProgramPreviewSwapped;
             swap.enabled = state.isConnected && multiview.supportsProgramPreviewSwap;
         }
-        if (multiview.index < self.multiviewOpacitySliders.count) {
-            NSSlider *opacity = self.multiviewOpacitySliders[multiview.index];
+        NSSlider *opacity = self.multiviewOpacitySliders[@(multiview.index)];
+        if (opacity) {
             opacity.doubleValue = multiview.vuMeterOpacity;
             opacity.enabled = state.isConnected && multiview.supportsVUMeters && multiview.canAdjustVUMeterOpacity;
         }
+
+        NSUInteger labelCount = 0;
+        NSUInteger visibleLabelCount = 0;
+        NSUInteger borderCount = multiview.windows.count;
+        NSUInteger visibleBorderCount = 0;
+        for (ATEMMultiviewWindowState *window in multiview.windows) {
+            if (window.supportsLabelOverlay) {
+                ++labelCount;
+                if (window.isLabelVisible)
+                    ++visibleLabelCount;
+            }
+            if (window.isBorderVisible)
+                ++visibleBorderCount;
+        }
+        ATEMControlButton *allLabels = self.multiviewAllLabelButtons[@(multiview.index)];
+        BOOL allLabelsVisible = labelCount > 0 && visibleLabelCount == labelCount;
+        allLabels.title = allLabelsVisible ? @"LABELS ON" : (visibleLabelCount > 0 ? @"LABELS MIXED" : @"LABELS OFF");
+        allLabels.active = allLabelsVisible;
+        allLabels.enabled = state.isConnected && multiview.canChangeOverlayProperties && labelCount > 0;
+        allLabels.accessibilityValue = allLabelsVisible ? @"All on" : (visibleLabelCount > 0 ? @"Mixed" : @"All off");
+
+        ATEMControlButton *allBorders = self.multiviewAllBorderButtons[@(multiview.index)];
+        BOOL allBordersVisible = borderCount > 0 && visibleBorderCount == borderCount;
+        allBorders.title = allBordersVisible ? @"BORDERS ON" : (visibleBorderCount > 0 ? @"BORDERS MIXED" : @"BORDERS OFF");
+        allBorders.active = allBordersVisible;
+        allBorders.enabled = state.isConnected && multiview.canChangeOverlayProperties && borderCount > 0;
+        allBorders.accessibilityValue = allBordersVisible ? @"All on" : (visibleBorderCount > 0 ? @"Mixed" : @"All off");
+
         for (ATEMMultiviewWindowState *window in multiview.windows) {
             NSNumber *key = @(MultiviewControlTag(multiview.index, window.index));
             NSPopUpButton *sourcePopup = self.multiviewSourcePopups[key];
@@ -1699,7 +1818,10 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
                     break;
                 }
             }
-            sourcePopup.enabled = state.isConnected && multiview.canRouteInputs;
+            sourcePopup.enabled = state.isConnected && window.canRouteInput;
+            sourcePopup.toolTip = window.canRouteInput
+                ? @"Select the source shown in this multiview window."
+                : @"Program/Preview windows are fixed on classic multiview layouts.";
             NSButton *vu = self.multiviewVUButtons[key];
             vu.state = window.isVUMeterEnabled ? NSControlStateValueOn : NSControlStateValueOff;
             vu.enabled = state.isConnected && multiview.supportsVUMeters && window.supportsVUMeter;
@@ -1741,6 +1863,16 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
 {
     (void)sender;
     [self.activeController enterDemoMode];
+}
+
+- (void)featurePressed:(NSButton *)sender
+{
+    NSArray<NSString *> *features = @[@"audio", @"color", @"hyperdeck"];
+    if (sender.tag < 0 || (NSUInteger)sender.tag >= features.count)
+        return;
+    void (^handler)(NSString *, NSUInteger) = self.featureActionHandler;
+    if (handler)
+        handler(features[(NSUInteger)sender.tag], self.activeSessionIndex);
 }
 
 - (void)programPressed:(ATEMInputButton *)sender { [self.activeController setProgramInput:sender.inputID]; }
@@ -1849,6 +1981,37 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
 - (void)multiviewOpacityChanged:(NSSlider *)sender
 {
     [self.activeController setMultiview:(NSUInteger)sender.tag vuMeterOpacity:sender.doubleValue];
+}
+
+- (void)multiviewAllLabelsPressed:(ATEMControlButton *)sender
+{
+    ATEMMultiviewState *multiview = [self multiviewStateForIndex:(NSUInteger)sender.tag];
+    if (!multiview)
+        return;
+    NSUInteger eligibleCount = 0;
+    NSUInteger visibleCount = 0;
+    for (ATEMMultiviewWindowState *window in multiview.windows) {
+        if (!window.supportsLabelOverlay)
+            continue;
+        ++eligibleCount;
+        if (window.isLabelVisible)
+            ++visibleCount;
+    }
+    if (eligibleCount > 0)
+        [self.activeController setMultiview:multiview.index allLabelsVisible:visibleCount != eligibleCount];
+}
+
+- (void)multiviewAllBordersPressed:(ATEMControlButton *)sender
+{
+    ATEMMultiviewState *multiview = [self multiviewStateForIndex:(NSUInteger)sender.tag];
+    if (!multiview || multiview.windows.count == 0)
+        return;
+    NSUInteger visibleCount = 0;
+    for (ATEMMultiviewWindowState *window in multiview.windows) {
+        if (window.isBorderVisible)
+            ++visibleCount;
+    }
+    [self.activeController setMultiview:multiview.index allBordersVisible:visibleCount != multiview.windows.count];
 }
 
 - (void)multiviewSourceChanged:(NSPopUpButton *)sender

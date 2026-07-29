@@ -1,6 +1,6 @@
 APP_NAME := ATEMCNTRL
 APP_DISPLAY_NAME := ATEM CNTRL
-APP_VERSION := 0.3.1
+APP_VERSION := 0.4.1
 BUNDLE_ID := com.local.atem-edit
 BUILD_DIR := build
 APP_BUNDLE := $(BUILD_DIR)/$(APP_DISPLAY_NAME).app
@@ -8,7 +8,9 @@ PACKAGE := $(BUILD_DIR)/ATEM-CNTRL-$(APP_VERSION)-macOS.zip
 CONTENTS := $(APP_BUNDLE)/Contents
 MACOS_DIR := $(CONTENTS)/MacOS
 RESOURCES_DIR := $(CONTENTS)/Resources
+HELPERS_DIR := $(CONTENTS)/Helpers
 BINARY := $(MACOS_DIR)/$(APP_NAME)
+CAMERA_HELPER := $(HELPERS_DIR)/ATEMCameraHelper
 
 SDK_ROOT := /Applications/Blackmagic ATEM Switchers/Developer SDK/Mac OS X
 SDK_INCLUDE := $(SDK_ROOT)/include
@@ -18,14 +20,17 @@ API_BUNDLE := /Library/Application Support/Blackmagic Design/Switchers/BMDSwitch
 SOURCES := \
 	Sources/main.mm \
 	Sources/ATEMController.mm \
-	Sources/ControlSurfaceWindowController.mm
+	Sources/ControlSurfaceWindowController.mm \
+	Sources/AudioWindowController.mm \
+	Sources/ColorWindowController.mm \
+	Sources/HyperDeckWindowController.mm
 
 CXX := xcrun clang++
 CXXFLAGS := -std=c++17 -fobjc-arc -fblocks -Wall -Wextra -Wno-deprecated-declarations \
 	-arch arm64 -arch x86_64 -mmacosx-version-min=13.0 -I"$(SDK_INCLUDE)" -I"Sources"
 LDFLAGS := -framework Cocoa -framework CoreFoundation
 
-.PHONY: all build package run demo preview preview-multiview test diagnose clean verify requirements
+.PHONY: all build package run demo preview preview-multiview preview-audio preview-color preview-hyperdeck test diagnose clean verify requirements
 
 all: build
 
@@ -36,11 +41,13 @@ requirements:
 		(printf '%s\n' "Missing BMDSwitcherAPI.bundle. Install ATEM Software Control before building." >&2; exit 1)
 
 build: requirements
-	@mkdir -p "$(MACOS_DIR)" "$(RESOURCES_DIR)"
+	@mkdir -p "$(MACOS_DIR)" "$(RESOURCES_DIR)" "$(HELPERS_DIR)"
 	$(CXX) $(CXXFLAGS) $(SOURCES) "$(SDK_DISPATCH)" -o "$(BINARY)" $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) Sources/CameraHelperMain.mm "$(SDK_DISPATCH)" -o "$(CAMERA_HELPER)" $(LDFLAGS)
 	cp Resources/Info.plist "$(CONTENTS)/Info.plist"
 	cp Resources/AppIcon.icns "$(RESOURCES_DIR)/AppIcon.icns"
 	cp Resources/Brand/ATEMCNTRL-Logo.png "$(RESOURCES_DIR)/ATEMCNTRL-Logo.png"
+	codesign --force --sign - "$(CAMERA_HELPER)"
 	codesign --force --deep --sign - "$(APP_BUNDLE)"
 
 package: build
@@ -57,6 +64,15 @@ preview: build
 
 preview-multiview: build
 	"$(BINARY)" --demo --render-multiview-preview "$(BUILD_DIR)/multiview-preview.png"
+
+preview-audio: build
+	"$(BINARY)" --demo --render-audio-preview "$(BUILD_DIR)/audio-preview.png"
+
+preview-color: build
+	"$(BINARY)" --demo --render-color-preview "$(BUILD_DIR)/color-preview.png"
+
+preview-hyperdeck: build
+	"$(BINARY)" --demo --render-hyperdeck-preview "$(BUILD_DIR)/hyperdeck-preview.png"
 
 test: build
 	"$(BINARY)" --self-test

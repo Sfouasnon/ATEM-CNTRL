@@ -29,6 +29,31 @@ typedef NS_OPTIONS(uint32_t, ATEMMultiviewLayout) {
     ATEMMultiviewLayoutBottomRightSmall = 0x08,
 };
 
+FOUNDATION_EXPORT NSNotificationName const ATEMAudioStateDidChangeNotification;
+FOUNDATION_EXPORT NSNotificationName const ATEMHyperDeckStateDidChangeNotification;
+FOUNDATION_EXPORT NSNotificationName const ATEMStateDidChangeNotification;
+
+typedef NS_ENUM(NSUInteger, ATEMAudioMixOption) {
+    ATEMAudioMixOptionOff = 0x00000001,
+    ATEMAudioMixOptionOn = 0x00000002,
+    ATEMAudioMixOptionAudioFollowVideo = 0x00000004,
+};
+
+typedef NS_ENUM(NSUInteger, ATEMHyperDeckConnectionStatus) {
+    ATEMHyperDeckConnectionStatusNotConnected = 0,
+    ATEMHyperDeckConnectionStatusConnecting,
+    ATEMHyperDeckConnectionStatusConnected,
+    ATEMHyperDeckConnectionStatusIncompatible,
+};
+
+typedef NS_ENUM(NSUInteger, ATEMHyperDeckPlayerState) {
+    ATEMHyperDeckPlayerStateUnknown = 0,
+    ATEMHyperDeckPlayerStateIdle,
+    ATEMHyperDeckPlayerStatePlay,
+    ATEMHyperDeckPlayerStateRecord,
+    ATEMHyperDeckPlayerStateShuttle,
+};
+
 @interface ATEMInputState : NSObject
 @property(nonatomic, readonly) int64_t inputID;
 @property(nonatomic, copy, readonly) NSString *longName;
@@ -77,6 +102,7 @@ typedef NS_OPTIONS(uint32_t, ATEMMultiviewLayout) {
 @interface ATEMMultiviewWindowState : NSObject
 @property(nonatomic, readonly) NSUInteger index;
 @property(nonatomic, readonly) int64_t sourceID;
+@property(nonatomic, readonly) BOOL canRouteInput;
 @property(nonatomic, readonly) BOOL supportsVUMeter;
 @property(nonatomic, readonly, getter=isVUMeterEnabled) BOOL vuMeterEnabled;
 @property(nonatomic, readonly) BOOL supportsSafeArea;
@@ -102,7 +128,58 @@ typedef NS_OPTIONS(uint32_t, ATEMMultiviewLayout) {
 @property(nonatomic, readonly) BOOL supportsProgramPreviewSwap;
 @property(nonatomic, readonly, getter=isProgramPreviewSwapped) BOOL programPreviewSwapped;
 @property(nonatomic, readonly) BOOL canChangeOverlayProperties;
+@property(nonatomic, readonly) NSUInteger totalWindowCount;
 @property(nonatomic, copy, readonly) NSArray<ATEMMultiviewWindowState *> *windows;
+@end
+
+@interface ATEMAudioChannelState : NSObject
+@property(nonatomic, readonly) int64_t inputID;
+@property(nonatomic, readonly) int64_t sourceID;
+@property(nonatomic, copy, readonly) NSString *name;
+@property(nonatomic, readonly, getter=isActive) BOOL active;
+@property(nonatomic, readonly) double faderGain;
+@property(nonatomic, readonly) double pan;
+@property(nonatomic, readonly) ATEMAudioMixOption mixOption;
+@property(nonatomic, readonly) NSUInteger supportedMixOptions;
+@property(nonatomic, copy, readonly) NSArray<NSNumber *> *levels;
+@property(nonatomic, copy, readonly) NSArray<NSNumber *> *peakLevels;
+@end
+
+@interface ATEMAudioState : NSObject
+@property(nonatomic, readonly, getter=isAvailable) BOOL available;
+@property(nonatomic, readonly, getter=isDemo) BOOL demo;
+@property(nonatomic, copy, readonly) NSString *statusMessage;
+@property(nonatomic, readonly) double masterFaderGain;
+@property(nonatomic, copy, readonly) NSArray<NSNumber *> *masterLevels;
+@property(nonatomic, copy, readonly) NSArray<NSNumber *> *masterPeakLevels;
+@property(nonatomic, copy, readonly) NSArray<ATEMAudioChannelState *> *channels;
+@end
+
+@interface ATEMHyperDeckClipState : NSObject
+@property(nonatomic, readonly) int64_t clipID;
+@property(nonatomic, copy, readonly) NSString *name;
+@property(nonatomic, copy, readonly) NSString *duration;
+@end
+
+@interface ATEMHyperDeckState : NSObject
+@property(nonatomic, readonly) int64_t deckID;
+@property(nonatomic, copy, readonly) NSString *name;
+@property(nonatomic, copy, readonly) NSString *modelName;
+@property(nonatomic, copy, readonly) NSString *networkAddress;
+@property(nonatomic, readonly) int64_t switcherInputID;
+@property(nonatomic, readonly) ATEMHyperDeckConnectionStatus connectionStatus;
+@property(nonatomic, readonly, getter=isRemoteAccessEnabled) BOOL remoteAccessEnabled;
+@property(nonatomic, readonly) ATEMHyperDeckPlayerState playerState;
+@property(nonatomic, readonly) int64_t currentClip;
+@property(nonatomic, readonly) NSUInteger clipCount;
+@property(nonatomic, copy, readonly) NSArray<ATEMHyperDeckClipState *> *clips;
+@property(nonatomic, copy, readonly) NSString *timecode;
+@property(nonatomic, copy, readonly) NSString *recordTimeRemaining;
+@property(nonatomic, readonly, getter=isLoopedPlayback) BOOL loopedPlayback;
+@property(nonatomic, readonly, getter=isSingleClipPlayback) BOOL singleClipPlayback;
+@property(nonatomic, readonly, getter=isAutoRollOnTake) BOOL autoRollOnTake;
+@property(nonatomic, readonly) NSUInteger autoRollFrameDelay;
+@property(nonatomic, readonly) NSInteger shuttleSpeed;
 @end
 
 @interface ATEMState : NSObject
@@ -134,6 +211,9 @@ typedef NS_OPTIONS(uint32_t, ATEMMultiviewLayout) {
 
 @property(nonatomic, copy, nullable) void (^stateHandler)(ATEMState *state);
 @property(nonatomic, readonly) ATEMState *latestState;
+@property(nonatomic, readonly) ATEMAudioState *latestAudioState;
+@property(nonatomic, copy, readonly) NSArray<ATEMHyperDeckState *> *latestHyperDeckStates;
+@property(nonatomic, copy, readonly) NSString *currentAddress;
 
 - (void)connectToAddress:(NSString *)address;
 - (void)disconnect;
@@ -161,6 +241,27 @@ typedef NS_OPTIONS(uint32_t, ATEMMultiviewLayout) {
 - (void)setMultiview:(NSUInteger)index window:(NSUInteger)window safeAreaEnabled:(BOOL)enabled;
 - (void)setMultiview:(NSUInteger)index window:(NSUInteger)window labelVisible:(BOOL)visible;
 - (void)setMultiview:(NSUInteger)index window:(NSUInteger)window borderVisible:(BOOL)visible;
+- (void)setMultiview:(NSUInteger)index allLabelsVisible:(BOOL)visible;
+- (void)setMultiview:(NSUInteger)index allBordersVisible:(BOOL)visible;
+
+- (void)setAudioInput:(int64_t)inputID source:(int64_t)sourceID faderGain:(double)gain;
+- (void)setAudioInput:(int64_t)inputID source:(int64_t)sourceID pan:(double)pan;
+- (void)setAudioInput:(int64_t)inputID source:(int64_t)sourceID mixOption:(ATEMAudioMixOption)mixOption;
+- (void)setAudioMasterFaderGain:(double)gain;
+- (void)resetAudioPeakLevels;
+
+- (void)setHyperDeck:(int64_t)deckID networkAddress:(NSString *)address;
+- (void)setHyperDeck:(int64_t)deckID switcherInput:(int64_t)inputID;
+- (void)playHyperDeck:(int64_t)deckID;
+- (void)recordHyperDeck:(int64_t)deckID;
+- (void)stopHyperDeck:(int64_t)deckID;
+- (void)jogHyperDeck:(int64_t)deckID frames:(NSInteger)frames;
+- (void)shuttleHyperDeck:(int64_t)deckID speed:(NSInteger)speedPercent;
+- (void)setHyperDeck:(int64_t)deckID currentClip:(int64_t)clipID;
+- (void)setHyperDeck:(int64_t)deckID loopedPlayback:(BOOL)enabled;
+- (void)setHyperDeck:(int64_t)deckID singleClipPlayback:(BOOL)enabled;
+- (void)setHyperDeck:(int64_t)deckID autoRollOnTake:(BOOL)enabled;
+- (void)setHyperDeck:(int64_t)deckID autoRollFrameDelay:(NSUInteger)frames;
 
 - (void)shutdown;
 

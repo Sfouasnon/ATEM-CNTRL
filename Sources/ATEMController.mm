@@ -3,11 +3,19 @@
 #import <Cocoa/Cocoa.h>
 #import <atomic>
 #import <cstring>
+#import <netinet/in.h>
+#import <arpa/inet.h>
 #import <vector>
+
+#include <cmath>
 
 #include "BMDSwitcherAPI.h"
 
 static NSString *const kATEMRuntimePath = @"/Library/Application Support/Blackmagic Design/Switchers/BMDSwitcherAPI.bundle";
+
+NSNotificationName const ATEMAudioStateDidChangeNotification = @"ATEMAudioStateDidChangeNotification";
+NSNotificationName const ATEMHyperDeckStateDidChangeNotification = @"ATEMHyperDeckStateDidChangeNotification";
+NSNotificationName const ATEMStateDidChangeNotification = @"ATEMStateDidChangeNotification";
 
 
 @interface ATEMInputState ()
@@ -109,6 +117,7 @@ static NSString *const kATEMRuntimePath = @"/Library/Application Support/Blackma
 @interface ATEMMultiviewWindowState ()
 @property(nonatomic, readwrite) NSUInteger index;
 @property(nonatomic, readwrite) int64_t sourceID;
+@property(nonatomic, readwrite) BOOL canRouteInput;
 @property(nonatomic, readwrite) BOOL supportsVUMeter;
 @property(nonatomic, readwrite, getter=isVUMeterEnabled) BOOL vuMeterEnabled;
 @property(nonatomic, readwrite) BOOL supportsSafeArea;
@@ -138,10 +147,77 @@ static NSString *const kATEMRuntimePath = @"/Library/Application Support/Blackma
 @property(nonatomic, readwrite) BOOL supportsProgramPreviewSwap;
 @property(nonatomic, readwrite, getter=isProgramPreviewSwapped) BOOL programPreviewSwapped;
 @property(nonatomic, readwrite) BOOL canChangeOverlayProperties;
+@property(nonatomic, readwrite) NSUInteger totalWindowCount;
 @property(nonatomic, copy, readwrite) NSArray<ATEMMultiviewWindowState *> *windows;
 @end
 
 @implementation ATEMMultiviewState
+@end
+
+
+@interface ATEMAudioChannelState ()
+@property(nonatomic, readwrite) int64_t inputID;
+@property(nonatomic, readwrite) int64_t sourceID;
+@property(nonatomic, copy, readwrite) NSString *name;
+@property(nonatomic, readwrite, getter=isActive) BOOL active;
+@property(nonatomic, readwrite) double faderGain;
+@property(nonatomic, readwrite) double pan;
+@property(nonatomic, readwrite) ATEMAudioMixOption mixOption;
+@property(nonatomic, readwrite) NSUInteger supportedMixOptions;
+@property(nonatomic, copy, readwrite) NSArray<NSNumber *> *levels;
+@property(nonatomic, copy, readwrite) NSArray<NSNumber *> *peakLevels;
+@end
+
+@implementation ATEMAudioChannelState
+@end
+
+
+@interface ATEMAudioState ()
+@property(nonatomic, readwrite, getter=isAvailable) BOOL available;
+@property(nonatomic, readwrite, getter=isDemo) BOOL demo;
+@property(nonatomic, copy, readwrite) NSString *statusMessage;
+@property(nonatomic, readwrite) double masterFaderGain;
+@property(nonatomic, copy, readwrite) NSArray<NSNumber *> *masterLevels;
+@property(nonatomic, copy, readwrite) NSArray<NSNumber *> *masterPeakLevels;
+@property(nonatomic, copy, readwrite) NSArray<ATEMAudioChannelState *> *channels;
+@end
+
+@implementation ATEMAudioState
+@end
+
+
+@interface ATEMHyperDeckClipState ()
+@property(nonatomic, readwrite) int64_t clipID;
+@property(nonatomic, copy, readwrite) NSString *name;
+@property(nonatomic, copy, readwrite) NSString *duration;
+@end
+
+@implementation ATEMHyperDeckClipState
+@end
+
+
+@interface ATEMHyperDeckState ()
+@property(nonatomic, readwrite) int64_t deckID;
+@property(nonatomic, copy, readwrite) NSString *name;
+@property(nonatomic, copy, readwrite) NSString *modelName;
+@property(nonatomic, copy, readwrite) NSString *networkAddress;
+@property(nonatomic, readwrite) int64_t switcherInputID;
+@property(nonatomic, readwrite) ATEMHyperDeckConnectionStatus connectionStatus;
+@property(nonatomic, readwrite, getter=isRemoteAccessEnabled) BOOL remoteAccessEnabled;
+@property(nonatomic, readwrite) ATEMHyperDeckPlayerState playerState;
+@property(nonatomic, readwrite) int64_t currentClip;
+@property(nonatomic, readwrite) NSUInteger clipCount;
+@property(nonatomic, copy, readwrite) NSArray<ATEMHyperDeckClipState *> *clips;
+@property(nonatomic, copy, readwrite) NSString *timecode;
+@property(nonatomic, copy, readwrite) NSString *recordTimeRemaining;
+@property(nonatomic, readwrite, getter=isLoopedPlayback) BOOL loopedPlayback;
+@property(nonatomic, readwrite, getter=isSingleClipPlayback) BOOL singleClipPlayback;
+@property(nonatomic, readwrite, getter=isAutoRollOnTake) BOOL autoRollOnTake;
+@property(nonatomic, readwrite) NSUInteger autoRollFrameDelay;
+@property(nonatomic, readwrite) NSInteger shuttleSpeed;
+@end
+
+@implementation ATEMHyperDeckState
 @end
 
 
@@ -231,12 +307,100 @@ private:
     std::atomic<ULONG> refCount_;
 };
 
+class FairlightMixerMonitor final : public IBMDSwitcherFairlightAudioMixerCallback
+{
+public:
+    explicit FairlightMixerMonitor(ATEMController *owner) : owner_(owner), refCount_(1) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, LPVOID *value) override;
+    ULONG STDMETHODCALLTYPE AddRef(void) override { return ++refCount_; }
+    ULONG STDMETHODCALLTYPE Release(void) override
+    {
+        ULONG count = --refCount_;
+        if (count == 0)
+            delete this;
+        return count;
+    }
+    HRESULT STDMETHODCALLTYPE Notify(BMDSwitcherFairlightAudioMixerEventType eventType) override;
+    HRESULT STDMETHODCALLTYPE MasterOutLevelNotification(uint32_t numLevels,
+                                                         const double *levels,
+                                                         uint32_t numPeakLevels,
+                                                         const double *peakLevels) override;
+
+private:
+    __unsafe_unretained ATEMController *owner_;
+    std::atomic<ULONG> refCount_;
+};
+
+class FairlightSourceMonitor final : public IBMDSwitcherFairlightAudioSourceCallback
+{
+public:
+    FairlightSourceMonitor(ATEMController *owner, int64_t inputID, int64_t sourceID)
+        : owner_(owner), inputID_(inputID), sourceID_(sourceID), refCount_(1) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, LPVOID *value) override;
+    ULONG STDMETHODCALLTYPE AddRef(void) override { return ++refCount_; }
+    ULONG STDMETHODCALLTYPE Release(void) override
+    {
+        ULONG count = --refCount_;
+        if (count == 0)
+            delete this;
+        return count;
+    }
+    HRESULT STDMETHODCALLTYPE Notify(BMDSwitcherFairlightAudioSourceEventType eventType) override;
+    HRESULT STDMETHODCALLTYPE OutputLevelNotification(uint32_t numLevels,
+                                                      const double *levels,
+                                                      uint32_t numPeakLevels,
+                                                      const double *peakLevels) override;
+
+private:
+    __unsafe_unretained ATEMController *owner_;
+    int64_t inputID_;
+    int64_t sourceID_;
+    std::atomic<ULONG> refCount_;
+};
+
 
 struct AuxAPIRecord
 {
     IBMDSwitcherInputAux *api = nullptr;
     __strong NSString *name = nil;
     uint32_t inputAvailabilityMask = 0;
+};
+
+struct FairlightSourceAPIRecord
+{
+    int64_t inputID = 0;
+    int64_t sourceID = 0;
+    IBMDSwitcherFairlightAudioSource *api = nullptr;
+    FairlightSourceMonitor *monitor = nullptr;
+    __strong NSString *name = nil;
+    std::vector<double> levels;
+    std::vector<double> peaks;
+};
+
+struct DemoAudioChannel
+{
+    int64_t inputID = 0;
+    int64_t sourceID = 0;
+    double faderGain = 0;
+    double pan = 0;
+    ATEMAudioMixOption mixOption = ATEMAudioMixOptionAudioFollowVideo;
+};
+
+struct DemoHyperDeck
+{
+    int64_t deckID = 0;
+    __strong NSString *address = nil;
+    int64_t switcherInputID = 1;
+    ATEMHyperDeckConnectionStatus connectionStatus = ATEMHyperDeckConnectionStatusNotConnected;
+    ATEMHyperDeckPlayerState playerState = ATEMHyperDeckPlayerStateIdle;
+    int64_t currentClip = -1;
+    bool loopedPlayback = false;
+    bool singleClipPlayback = false;
+    bool autoRollOnTake = false;
+    NSUInteger autoRollFrameDelay = 0;
+    NSInteger shuttleSpeed = 0;
 };
 
 struct DemoMultiview
@@ -251,11 +415,86 @@ struct DemoMultiview
     std::vector<bool> borders;
 };
 
+template <typename T>
+struct PendingMultiviewValue
+{
+    bool active = false;
+    T value {};
+    CFAbsoluteTime expiresAt = 0;
+};
+
+struct PendingMultiview
+{
+    PendingMultiviewValue<ATEMMultiviewLayout> layout;
+    PendingMultiviewValue<bool> programPreviewSwapped;
+    PendingMultiviewValue<double> vuMeterOpacity;
+    std::vector<PendingMultiviewValue<int64_t>> sources;
+    std::vector<PendingMultiviewValue<bool>> vuMeters;
+    std::vector<PendingMultiviewValue<bool>> safeAreas;
+    std::vector<PendingMultiviewValue<bool>> labels;
+    std::vector<PendingMultiviewValue<bool>> borders;
+};
+
+static constexpr CFTimeInterval kMultiviewReadbackGracePeriod = 2.0;
+
+template <typename T>
+static void MarkPendingMultiviewValue(PendingMultiviewValue<T> &pending, T value)
+{
+    pending.active = true;
+    pending.value = value;
+    pending.expiresAt = CFAbsoluteTimeGetCurrent() + kMultiviewReadbackGracePeriod;
+}
+
+template <typename T>
+static void ReconcilePendingMultiviewValue(PendingMultiviewValue<T> &pending,
+                                           HRESULT readResult,
+                                           T *value)
+{
+    if (!pending.active)
+        return;
+    if (SUCCEEDED(readResult) && *value == pending.value) {
+        pending.active = false;
+        return;
+    }
+    if (CFAbsoluteTimeGetCurrent() <= pending.expiresAt)
+        *value = pending.value;
+    else
+        pending.active = false;
+}
+
+static void ReconcilePendingMultiviewOpacity(PendingMultiviewValue<double> &pending,
+                                             HRESULT readResult,
+                                             double *value)
+{
+    if (!pending.active)
+        return;
+    if (SUCCEEDED(readResult) && std::fabs(*value - pending.value) < 0.001) {
+        pending.active = false;
+        return;
+    }
+    if (CFAbsoluteTimeGetCurrent() <= pending.expiresAt)
+        *value = pending.value;
+    else
+        pending.active = false;
+}
+
+static void EnsurePendingMultiviewWindowCount(PendingMultiview &pending, NSUInteger count)
+{
+    if (pending.sources.size() >= count)
+        return;
+    pending.sources.resize(count);
+    pending.vuMeters.resize(count);
+    pending.safeAreas.resize(count);
+    pending.labels.resize(count);
+    pending.borders.resize(count);
+}
+
 
 @interface ATEMController ()
 {
     dispatch_queue_t _controlQueue;
     dispatch_source_t _pollTimer;
+    dispatch_source_t _featureTimer;
     BOOL _shutdown;
 
     IBMDSwitcherDiscovery *_discovery;
@@ -273,12 +512,25 @@ struct DemoMultiview
     std::vector<IBMDSwitcherDownstreamKey *> _downstreamKeyAPIs;
     std::vector<AuxAPIRecord> _auxAPIs;
     std::vector<IBMDSwitcherMultiView *> _multiviewAPIs;
+    std::vector<PendingMultiview> _pendingMultiviews;
+    NSArray<ATEMMultiviewState *> *_lastKnownMultiviews;
+    IBMDSwitcherFairlightAudioMixer *_fairlightMixer;
+    FairlightMixerMonitor *_fairlightMixerMonitor;
+    std::vector<FairlightSourceAPIRecord> _fairlightSources;
+    std::vector<double> _masterAudioLevels;
+    std::vector<double> _masterAudioPeaks;
+    std::vector<IBMDSwitcherHyperDeck *> _hyperDeckAPIs;
+    NSMutableDictionary<NSNumber *, NSArray<ATEMHyperDeckClipState *> *> *_hyperDeckClipCache;
+    NSMutableDictionary<NSNumber *, NSNumber *> *_hyperDeckClipCacheTimes;
+    NSMutableDictionary<NSNumber *, NSNumber *> *_hyperDeckClipCacheCounts;
 
     BOOL _connecting;
     BOOL _demo;
+    NSString *_targetAddressLocked;
     NSString *_productName;
     NSString *_statusMessage;
     NSArray<ATEMInputState *> *_inputStates;
+    NSDictionary<NSNumber *, NSString *> *_inputNamesByID;
     uint32_t _mixEffectInputAvailabilityMask;
 
     int64_t _demoProgram;
@@ -294,13 +546,34 @@ struct DemoMultiview
     std::vector<bool> _demoDSKTied;
     std::vector<int64_t> _demoAuxSources;
     std::vector<DemoMultiview> _demoMultiviews;
+    std::vector<DemoAudioChannel> _demoAudioChannels;
+    double _demoMasterAudioFader;
+    std::vector<DemoHyperDeck> _demoHyperDecks;
 }
 
 @property(nonatomic, strong, readwrite) ATEMState *latestState;
+@property(nonatomic, strong, readwrite) ATEMAudioState *latestAudioState;
+@property(nonatomic, copy, readwrite) NSArray<ATEMHyperDeckState *> *latestHyperDeckStates;
+@property(nonatomic, copy, readwrite) NSString *currentAddress;
 
 - (void)sdkStateChanged;
+- (void)sdkAudioStateChanged;
+- (void)audioMasterLevelsChanged:(const double *)levels
+                           count:(uint32_t)count
+                      peakLevels:(const double *)peakLevels
+                       peakCount:(uint32_t)peakCount;
+- (void)audioInput:(int64_t)inputID
+             source:(int64_t)sourceID
+      levelsChanged:(const double *)levels
+              count:(uint32_t)count
+         peakLevels:(const double *)peakLevels
+          peakCount:(uint32_t)peakCount;
 - (void)switcherDisconnectedByDevice;
 - (void)publishStateLocked;
+- (void)publishFeatureStatesLocked;
+- (NSArray<ATEMHyperDeckClipState *> *)clipsForHyperDeckLocked:(IBMDSwitcherHyperDeck *)api
+                                                        deckID:(int64_t)deckID
+                                                     clipCount:(NSUInteger)clipCount;
 - (void)disconnectLockedWithMessage:(NSString *)message;
 @end
 
@@ -358,6 +631,82 @@ HRESULT MixEffectBlockMonitor::Notify(BMDSwitcherMixEffectBlockEventType eventTy
     return S_OK;
 }
 
+HRESULT FairlightMixerMonitor::QueryInterface(REFIID iid, LPVOID *value)
+{
+    if (!value)
+        return E_POINTER;
+    if (InterfaceIDsEqual(iid, IID_IBMDSwitcherFairlightAudioMixerCallback)) {
+        *value = static_cast<IBMDSwitcherFairlightAudioMixerCallback *>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (InterfaceIDEqualsUUID(iid, IUnknownUUID)) {
+        *value = static_cast<IUnknown *>(this);
+        AddRef();
+        return S_OK;
+    }
+    *value = nullptr;
+    return E_NOINTERFACE;
+}
+
+HRESULT FairlightMixerMonitor::Notify(BMDSwitcherFairlightAudioMixerEventType eventType)
+{
+    (void)eventType;
+    [owner_ sdkAudioStateChanged];
+    return S_OK;
+}
+
+HRESULT FairlightMixerMonitor::MasterOutLevelNotification(uint32_t numLevels,
+                                                          const double *levels,
+                                                          uint32_t numPeakLevels,
+                                                          const double *peakLevels)
+{
+    [owner_ audioMasterLevelsChanged:levels
+                               count:numLevels
+                          peakLevels:peakLevels
+                           peakCount:numPeakLevels];
+    return S_OK;
+}
+
+HRESULT FairlightSourceMonitor::QueryInterface(REFIID iid, LPVOID *value)
+{
+    if (!value)
+        return E_POINTER;
+    if (InterfaceIDsEqual(iid, IID_IBMDSwitcherFairlightAudioSourceCallback)) {
+        *value = static_cast<IBMDSwitcherFairlightAudioSourceCallback *>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (InterfaceIDEqualsUUID(iid, IUnknownUUID)) {
+        *value = static_cast<IUnknown *>(this);
+        AddRef();
+        return S_OK;
+    }
+    *value = nullptr;
+    return E_NOINTERFACE;
+}
+
+HRESULT FairlightSourceMonitor::Notify(BMDSwitcherFairlightAudioSourceEventType eventType)
+{
+    (void)eventType;
+    [owner_ sdkAudioStateChanged];
+    return S_OK;
+}
+
+HRESULT FairlightSourceMonitor::OutputLevelNotification(uint32_t numLevels,
+                                                        const double *levels,
+                                                        uint32_t numPeakLevels,
+                                                        const double *peakLevels)
+{
+    [owner_ audioInput:inputID_
+                 source:sourceID_
+          levelsChanged:levels
+                  count:numLevels
+             peakLevels:peakLevels
+              peakCount:numPeakLevels];
+    return S_OK;
+}
+
 
 static NSString *StringFromOwnedCFString(CFStringRef value)
 {
@@ -366,6 +715,86 @@ static NSString *StringFromOwnedCFString(CFStringRef value)
     NSString *result = [(__bridge NSString *)value copy];
     CFRelease(value);
     return result;
+}
+
+static NSArray<NSNumber *> *NumbersFromValues(const std::vector<double> &values)
+{
+    NSMutableArray<NSNumber *> *numbers = [NSMutableArray arrayWithCapacity:values.size()];
+    for (double value : values)
+        [numbers addObject:@(value)];
+    return numbers;
+}
+
+static NSString *InputNameForID(NSArray<ATEMInputState *> *inputs, int64_t inputID)
+{
+    for (ATEMInputState *input in inputs)
+        if (input.inputID == inputID)
+            return input.longName;
+    return [NSString stringWithFormat:@"Input %lld", inputID];
+}
+
+static ATEMHyperDeckConnectionStatus AppHyperDeckConnectionStatus(BMDSwitcherHyperDeckConnectionStatus status)
+{
+    switch (status) {
+        case bmdSwitcherHyperDeckConnectionStatusConnecting:
+            return ATEMHyperDeckConnectionStatusConnecting;
+        case bmdSwitcherHyperDeckConnectionStatusConnected:
+            return ATEMHyperDeckConnectionStatusConnected;
+        case bmdSwitcherHyperDeckConnectionStatusIncompatible:
+            return ATEMHyperDeckConnectionStatusIncompatible;
+        case bmdSwitcherHyperDeckConnectionStatusNotConnected:
+        default:
+            return ATEMHyperDeckConnectionStatusNotConnected;
+    }
+}
+
+static ATEMHyperDeckPlayerState AppHyperDeckPlayerState(BMDSwitcherHyperDeckPlayerState state)
+{
+    switch (state) {
+        case bmdSwitcherHyperDeckStateIdle: return ATEMHyperDeckPlayerStateIdle;
+        case bmdSwitcherHyperDeckStatePlay: return ATEMHyperDeckPlayerStatePlay;
+        case bmdSwitcherHyperDeckStateRecord: return ATEMHyperDeckPlayerStateRecord;
+        case bmdSwitcherHyperDeckStateShuttle: return ATEMHyperDeckPlayerStateShuttle;
+        case bmdSwitcherHyperDeckStateUnknown:
+        default: return ATEMHyperDeckPlayerStateUnknown;
+    }
+}
+
+static NSString *TimecodeString(uint16_t hours, uint8_t minutes, uint8_t seconds, uint8_t frames)
+{
+    return [NSString stringWithFormat:@"%02u:%02u:%02u:%02u", hours, minutes, seconds, frames];
+}
+
+// The ATEM SDK specifies a packed IPv4 value with the least-significant byte first.
+static BOOL PackHyperDeckAddress(NSString *address, uint32_t *packedAddress)
+{
+    if (!packedAddress)
+        return NO;
+    NSArray<NSString *> *parts = [address componentsSeparatedByString:@"."];
+    if (parts.count != 4)
+        return NO;
+    uint32_t packed = 0;
+    for (NSUInteger index = 0; index < 4; ++index) {
+        NSString *part = parts[index];
+        NSScanner *scanner = [NSScanner scannerWithString:part];
+        NSInteger value = -1;
+        if (![scanner scanInteger:&value] || !scanner.isAtEnd || value < 0 || value > 255)
+            return NO;
+        packed |= ((uint32_t)value) << (index * 8);
+    }
+    *packedAddress = packed;
+    return YES;
+}
+
+static NSString *UnpackHyperDeckAddress(uint32_t packedAddress)
+{
+    if (packedAddress == 0)
+        return @"";
+    return [NSString stringWithFormat:@"%u.%u.%u.%u",
+            packedAddress & 0xFFU,
+            (packedAddress >> 8U) & 0xFFU,
+            (packedAddress >> 16U) & 0xFFU,
+            (packedAddress >> 24U) & 0xFFU];
 }
 
 static ATEMTransitionStyle AppTransitionStyle(BMDSwitcherTransitionStyle style)
@@ -413,6 +842,61 @@ static NSUInteger ActiveQuadrantWindowCount(ATEMMultiviewLayout layout)
     return 4 + splitQuadrants * 3;
 }
 
+static constexpr uint32_t kQuadrantPhysicalWindowCount = 16;
+
+static uint32_t NormalizedMultiviewWindowCount(BOOL supportsQuadrantLayout,
+                                                uint32_t reportedWindowCount)
+{
+    reportedWindowCount = MIN(reportedWindowCount, 64U);
+    return supportsQuadrantLayout
+        ? MAX(reportedWindowCount, kQuadrantPhysicalWindowCount)
+        : reportedWindowCount;
+}
+
+static BOOL CanRouteMultiviewWindow(BOOL supportsQuadrantLayout, NSUInteger window)
+{
+    // On classic multiviews the SDK reserves windows 0 and 1 for
+    // Program/Preview. Quadrant-capable models may route every grid cell.
+    return supportsQuadrantLayout || window >= 2;
+}
+
+// Quadrant-capable ATEMs expose a fixed 4x4 grid of 16 SDK window IDs.
+// A large quadrant uses the top-left ID of its 2x2 block; splitting that
+// quadrant reveals all four IDs. The IDs therefore stay sparse whenever one
+// or more quadrants are large:
+//   TL {0,1,4,5}, TR {2,3,6,7}, BL {8,9,12,13}, BR {10,11,14,15}.
+static std::vector<uint32_t> VisibleQuadrantWindowIndices(ATEMMultiviewLayout layout)
+{
+    std::vector<uint32_t> indices;
+    uint32_t layoutMask = (uint32_t)layout & 0x0FU;
+    for (uint32_t index = 0; index < kQuadrantPhysicalWindowCount; ++index) {
+        uint32_t row = index / 4;
+        uint32_t column = index % 4;
+        ATEMMultiviewLayout quadrantBit;
+        if (row < 2)
+            quadrantBit = column < 2 ? ATEMMultiviewLayoutTopLeftSmall
+                                     : ATEMMultiviewLayoutTopRightSmall;
+        else
+            quadrantBit = column < 2 ? ATEMMultiviewLayoutBottomLeftSmall
+                                     : ATEMMultiviewLayoutBottomRightSmall;
+        BOOL quadrantIsSplit =
+            (layoutMask & (uint32_t)quadrantBit) != 0;
+        BOOL isLargeWindowPrimary = (row % 2 == 0) && (column % 2 == 0);
+        if (quadrantIsSplit || isLargeWindowPrimary)
+            indices.push_back(index);
+    }
+    return indices;
+}
+
+static ATEMMultiviewWindowState *MultiviewWindowStateForIndex(ATEMMultiviewState *state,
+                                                              NSUInteger physicalIndex)
+{
+    for (ATEMMultiviewWindowState *window in state.windows)
+        if (window.index == physicalIndex)
+            return window;
+    return nil;
+}
+
 static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
 {
     switch (failure) {
@@ -443,14 +927,29 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     _controlQueue = dispatch_queue_create("com.local.atem-cntrl.control", DISPATCH_QUEUE_SERIAL);
     _switcherMonitor = new SwitcherMonitor(self);
     _mixEffectBlockMonitor = new MixEffectBlockMonitor(self);
+    _fairlightMixerMonitor = new FairlightMixerMonitor(self);
+    _targetAddressLocked = @"";
     _productName = @"";
     _statusMessage = [ATEMController isRuntimeInstalled]
         ? @"Enter the switcher IP address to connect."
         : @"Blackmagic Switchers runtime not found. Install ATEM Software Control first.";
     _inputStates = @[];
+    _inputNamesByID = @{};
+    _hyperDeckClipCache = [NSMutableDictionary dictionary];
+    _hyperDeckClipCacheTimes = [NSMutableDictionary dictionary];
+    _hyperDeckClipCacheCounts = [NSMutableDictionary dictionary];
+    _lastKnownMultiviews = @[];
     _demoRate = 25;
     _demoSelection = ATEMTransitionSelectionBackground;
     self.latestState = [self emptyStateWithMessage:_statusMessage];
+    ATEMAudioState *audioState = [[ATEMAudioState alloc] init];
+    audioState.statusMessage = @"Connect an ATEM with Fairlight audio support.";
+    audioState.masterLevels = @[];
+    audioState.masterPeakLevels = @[];
+    audioState.channels = @[];
+    self.latestAudioState = audioState;
+    self.latestHyperDeckStates = @[];
+    self.currentAddress = @"";
 
     __weak ATEMController *weakSelf = self;
     dispatch_async(_controlQueue, ^{
@@ -474,6 +973,18 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
             [strongSelf publishStateLocked];
     });
     dispatch_resume(_pollTimer);
+
+    _featureTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _controlQueue);
+    dispatch_source_set_timer(_featureTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
+                              100 * NSEC_PER_MSEC,
+                              25 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(_featureTimer, ^{
+        ATEMController *strongSelf = weakSelf;
+        if (strongSelf && (strongSelf->_switcher || strongSelf->_demo))
+            [strongSelf publishFeatureStatesLocked];
+    });
+    dispatch_resume(_featureTimer);
 
     return self;
 }
@@ -525,6 +1036,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
         [self disconnectLockedWithMessage:@""];
         self->_connecting = YES;
         self->_demo = NO;
+        self->_targetAddressLocked = [trimmed copy];
         self->_statusMessage = [NSString stringWithFormat:@"Connecting to %@…", trimmed];
         [self publishStateLocked];
 
@@ -587,6 +1099,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     _mixEffectBlock->GetInputAvailabilityMask(&meAvailability);
     _mixEffectInputAvailabilityMask = (uint32_t)meAvailability;
     NSMutableArray<ATEMInputState *> *inputs = [NSMutableArray array];
+    NSMutableDictionary<NSNumber *, NSString *> *inputNames = [NSMutableDictionary dictionary];
     IBMDSwitcherInputIterator *inputIterator = nullptr;
     if (SUCCEEDED(_switcher->CreateIterator(IID_IBMDSwitcherInputIterator, (void **)&inputIterator)) && inputIterator) {
         IBMDSwitcherInput *input = nullptr;
@@ -603,6 +1116,10 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
             input->GetShortName(&shortName);
             NSString *longValue = StringFromOwnedCFString(longName);
             NSString *shortValue = StringFromOwnedCFString(shortName);
+            NSString *displayName = longValue.length
+                ? longValue
+                : (shortValue.length ? shortValue : [NSString stringWithFormat:@"Input %lld", inputID]);
+            inputNames[@(inputID)] = displayName;
 
             if (portType != bmdSwitcherPortTypeAuxOutput &&
                 portType != bmdSwitcherPortTypeMultiview &&
@@ -631,6 +1148,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
         inputIterator->Release();
     }
     _inputStates = [inputs copy];
+    _inputNamesByID = [inputNames copy];
 
     IBMDSwitcherKeyIterator *keyIterator = nullptr;
     if (SUCCEEDED(_mixEffectBlock->CreateIterator(IID_IBMDSwitcherKeyIterator, (void **)&keyIterator)) && keyIterator) {
@@ -661,6 +1179,65 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
         }
         multiviewIterator->Release();
     }
+    _pendingMultiviews.resize(_multiviewAPIs.size());
+
+    if (SUCCEEDED(_switcher->QueryInterface(IID_IBMDSwitcherFairlightAudioMixer,
+                                             (void **)&_fairlightMixer)) &&
+        _fairlightMixer) {
+        _fairlightMixer->AddCallback(_fairlightMixerMonitor);
+        _fairlightMixer->SetAllLevelNotificationsEnabled(true);
+
+        IBMDSwitcherFairlightAudioInputIterator *audioInputIterator = nullptr;
+        if (SUCCEEDED(_fairlightMixer->CreateIterator(IID_IBMDSwitcherFairlightAudioInputIterator,
+                                                       (void **)&audioInputIterator)) &&
+            audioInputIterator) {
+            IBMDSwitcherFairlightAudioInput *audioInput = nullptr;
+            while (audioInputIterator->Next(&audioInput) == S_OK && audioInput) {
+                BMDSwitcherAudioInputId inputID = 0;
+                audioInput->GetId(&inputID);
+                IBMDSwitcherFairlightAudioSourceIterator *sourceIterator = nullptr;
+                if (SUCCEEDED(audioInput->CreateIterator(IID_IBMDSwitcherFairlightAudioSourceIterator,
+                                                          (void **)&sourceIterator)) &&
+                    sourceIterator) {
+                    IBMDSwitcherFairlightAudioSource *source = nullptr;
+                    NSUInteger sourceNumber = 0;
+                    while (sourceIterator->Next(&source) == S_OK && source) {
+                        BMDSwitcherFairlightAudioSourceId sourceID = 0;
+                        source->GetId(&sourceID);
+                        FairlightSourceAPIRecord record;
+                        record.inputID = inputID;
+                        record.sourceID = sourceID;
+                        record.api = source;
+                        record.monitor = new FairlightSourceMonitor(self, inputID, sourceID);
+                        NSString *baseName = _inputNamesByID[@(inputID)] ?: InputNameForID(_inputStates, inputID);
+                        record.name = sourceNumber == 0
+                            ? baseName
+                            : [NSString stringWithFormat:@"%@ %lu", baseName, (unsigned long)sourceNumber + 1];
+                        source->AddCallback(record.monitor);
+                        _fairlightSources.push_back(record);
+                        ++sourceNumber;
+                        source = nullptr;
+                    }
+                    sourceIterator->Release();
+                }
+                audioInput->Release();
+                audioInput = nullptr;
+            }
+            audioInputIterator->Release();
+        }
+    }
+
+    IBMDSwitcherHyperDeckIterator *hyperDeckIterator = nullptr;
+    if (SUCCEEDED(_switcher->CreateIterator(IID_IBMDSwitcherHyperDeckIterator,
+                                             (void **)&hyperDeckIterator)) &&
+        hyperDeckIterator) {
+        IBMDSwitcherHyperDeck *hyperDeck = nullptr;
+        while (hyperDeckIterator->Next(&hyperDeck) == S_OK && hyperDeck) {
+            _hyperDeckAPIs.push_back(hyperDeck);
+            hyperDeck = nullptr;
+        }
+        hyperDeckIterator->Release();
+    }
 
     return YES;
 }
@@ -677,7 +1254,40 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
 {
     _connecting = NO;
     _demo = NO;
+    _targetAddressLocked = @"";
     _demoMultiviews.clear();
+    _demoAudioChannels.clear();
+    _demoHyperDecks.clear();
+    _pendingMultiviews.clear();
+    _lastKnownMultiviews = @[];
+
+    for (IBMDSwitcherHyperDeck *hyperDeck : _hyperDeckAPIs)
+        hyperDeck->Release();
+    _hyperDeckAPIs.clear();
+    [_hyperDeckClipCache removeAllObjects];
+    [_hyperDeckClipCacheTimes removeAllObjects];
+    [_hyperDeckClipCacheCounts removeAllObjects];
+
+    for (FairlightSourceAPIRecord &record : _fairlightSources) {
+        if (record.api && record.monitor)
+            record.api->RemoveCallback(record.monitor);
+        if (record.api)
+            record.api->Release();
+        if (record.monitor)
+            record.monitor->Release();
+        record.api = nullptr;
+        record.monitor = nullptr;
+        record.name = nil;
+    }
+    _fairlightSources.clear();
+    _masterAudioLevels.clear();
+    _masterAudioPeaks.clear();
+    if (_fairlightMixer) {
+        _fairlightMixer->SetAllLevelNotificationsEnabled(false);
+        _fairlightMixer->RemoveCallback(_fairlightMixerMonitor);
+        _fairlightMixer->Release();
+        _fairlightMixer = nullptr;
+    }
 
     for (IBMDSwitcherMultiView *multiview : _multiviewAPIs)
         multiview->Release();
@@ -718,9 +1328,11 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
 
     _productName = @"";
     _inputStates = @[];
+    _inputNamesByID = @{};
     _mixEffectInputAvailabilityMask = 0;
     if (message.length)
         _statusMessage = message;
+    [self publishFeatureStatesLocked];
 }
 
 - (void)sdkStateChanged
@@ -728,6 +1340,55 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     dispatch_async(_controlQueue, ^{
         if (self->_switcher)
             [self publishStateLocked];
+    });
+}
+
+- (void)sdkAudioStateChanged
+{
+    // Fairlight can emit a burst of property callbacks while a fader moves. The
+    // feature timer coalesces those changes into a bounded 10 Hz UI refresh.
+}
+
+- (void)audioMasterLevelsChanged:(const double *)levels
+                           count:(uint32_t)count
+                      peakLevels:(const double *)peakLevels
+                       peakCount:(uint32_t)peakCount
+{
+    std::vector<double> levelCopy;
+    std::vector<double> peakCopy;
+    if (levels && count)
+        levelCopy.assign(levels, levels + count);
+    if (peakLevels && peakCount)
+        peakCopy.assign(peakLevels, peakLevels + peakCount);
+    dispatch_async(_controlQueue, ^{
+        if (!self->_fairlightMixer)
+            return;
+        self->_masterAudioLevels = levelCopy;
+        self->_masterAudioPeaks = peakCopy;
+    });
+}
+
+- (void)audioInput:(int64_t)inputID
+             source:(int64_t)sourceID
+      levelsChanged:(const double *)levels
+              count:(uint32_t)count
+         peakLevels:(const double *)peakLevels
+          peakCount:(uint32_t)peakCount
+{
+    std::vector<double> levelCopy;
+    std::vector<double> peakCopy;
+    if (levels && count)
+        levelCopy.assign(levels, levels + count);
+    if (peakLevels && peakCount)
+        peakCopy.assign(peakLevels, peakLevels + peakCount);
+    dispatch_async(_controlQueue, ^{
+        for (FairlightSourceAPIRecord &record : self->_fairlightSources) {
+            if (record.inputID != inputID || record.sourceID != sourceID)
+                continue;
+            record.levels = levelCopy;
+            record.peaks = peakCopy;
+            break;
+        }
     });
 }
 
@@ -744,6 +1405,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     dispatch_async(_controlQueue, ^{
         [self disconnectLockedWithMessage:@""];
         self->_demo = YES;
+        self->_targetAddressLocked = @"demo";
         self->_productName = @"ATEM Mini Extreme — Demo";
         self->_statusMessage = @"Demo mode: controls are simulated and no hardware commands are sent.";
         NSArray<NSString *> *names = @[@"Camera 1", @"Camera 2", @"Camera 3", @"Camera 4",
@@ -759,6 +1421,10 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
                                                availabilityMask:0xFFFFFFFFU]];
         }];
         self->_inputStates = [inputs copy];
+        NSMutableDictionary<NSNumber *, NSString *> *inputNames = [NSMutableDictionary dictionary];
+        for (ATEMInputState *input in self->_inputStates)
+            inputNames[@(input.inputID)] = input.longName;
+        self->_inputNamesByID = [inputNames copy];
         self->_mixEffectInputAvailabilityMask = 0xFFFFFFFFU;
         self->_demoProgram = 1;
         self->_demoPreview = 2;
@@ -785,6 +1451,36 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
             }
             self->_demoMultiviews.push_back(multiview);
         }
+        self->_demoMasterAudioFader = 0;
+        self->_demoAudioChannels.clear();
+        for (NSUInteger index = 0; index < 8; ++index) {
+            DemoAudioChannel channel;
+            channel.inputID = (int64_t)index + 1;
+            // Fairlight source IDs are scoped to their input and commonly repeat.
+            channel.sourceID = 0;
+            channel.faderGain = index == 0 ? 0 : -3.0 - (double)index;
+            channel.pan = 0;
+            channel.mixOption = index < 4
+                ? ATEMAudioMixOptionAudioFollowVideo
+                : ATEMAudioMixOptionOn;
+            self->_demoAudioChannels.push_back(channel);
+        }
+        self->_demoHyperDecks.clear();
+        DemoHyperDeck deckOne;
+        deckOne.deckID = 1;
+        deckOne.address = @"192.168.10.50";
+        deckOne.switcherInputID = 7;
+        deckOne.connectionStatus = ATEMHyperDeckConnectionStatusConnected;
+        deckOne.playerState = ATEMHyperDeckPlayerStateIdle;
+        deckOne.currentClip = 10;
+        deckOne.autoRollOnTake = true;
+        deckOne.autoRollFrameDelay = 12;
+        self->_demoHyperDecks.push_back(deckOne);
+        DemoHyperDeck deckTwo;
+        deckTwo.deckID = 2;
+        deckTwo.address = @"";
+        deckTwo.switcherInputID = 8;
+        self->_demoHyperDecks.push_back(deckTwo);
         [self publishStateLocked];
     });
 }
@@ -857,12 +1553,15 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
             multiview.supportsProgramPreviewSwap = YES;
             multiview.programPreviewSwapped = demoMultiview.programPreviewSwapped;
             multiview.canChangeOverlayProperties = YES;
+            multiview.totalWindowCount = demoMultiview.sources.size();
             NSMutableArray<ATEMMultiviewWindowState *> *windows = [NSMutableArray array];
-            NSUInteger activeWindowCount = MIN(ActiveQuadrantWindowCount(demoMultiview.layout), demoMultiview.sources.size());
-            for (NSUInteger windowIndex = 0; windowIndex < activeWindowCount; ++windowIndex) {
+            std::vector<uint32_t> visibleWindowIndices =
+                VisibleQuadrantWindowIndices(demoMultiview.layout);
+            for (uint32_t windowIndex : visibleWindowIndices) {
                 ATEMMultiviewWindowState *window = [[ATEMMultiviewWindowState alloc] init];
                 window.index = windowIndex;
                 window.sourceID = demoMultiview.sources[windowIndex];
+                window.canRouteInput = YES;
                 window.supportsVUMeter = YES;
                 window.vuMeterEnabled = demoMultiview.vuMeters[windowIndex];
                 window.supportsSafeArea = YES;
@@ -960,92 +1659,149 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
                                                        sourceID:sourceID
                                           inputAvailabilityMask:_auxAPIs[index].inputAvailabilityMask]];
         }
+        if (_pendingMultiviews.size() < _multiviewAPIs.size())
+            _pendingMultiviews.resize(_multiviewAPIs.size());
         for (NSUInteger index = 0; index < _multiviewAPIs.size(); ++index) {
             IBMDSwitcherMultiView *api = _multiviewAPIs[index];
+            PendingMultiview &pending = _pendingMultiviews[index];
+            ATEMMultiviewState *previous = index < _lastKnownMultiviews.count ? _lastKnownMultiviews[index] : nil;
             ATEMMultiviewState *multiview = [[ATEMMultiviewState alloc] init];
             multiview.index = index;
 
             bool boolValue = false;
-            api->CanChangeLayout(&boolValue);
-            multiview.canChangeLayout = boolValue;
-            BMDSwitcherMultiViewLayout layout = bmdSwitcherMultiViewLayoutProgramTop;
-            api->GetLayout(&layout);
-            multiview.layout = (ATEMMultiviewLayout)layout;
+            multiview.canChangeLayout = SUCCEEDED(api->CanChangeLayout(&boolValue))
+                ? boolValue : (previous ? previous.canChangeLayout : NO);
+            ATEMMultiviewLayout appLayout = previous ? previous.layout : ATEMMultiviewLayoutProgramTop;
+            BMDSwitcherMultiViewLayout layout = (BMDSwitcherMultiViewLayout)appLayout;
+            HRESULT layoutResult = api->GetLayout(&layout);
+            if (SUCCEEDED(layoutResult))
+                appLayout = (ATEMMultiviewLayout)layout;
+            ReconcilePendingMultiviewValue(pending.layout, layoutResult, &appLayout);
+            multiview.layout = appLayout;
             boolValue = false;
-            api->SupportsQuadrantLayout(&boolValue);
-            multiview.supportsQuadrantLayout = boolValue;
+            multiview.supportsQuadrantLayout = SUCCEEDED(api->SupportsQuadrantLayout(&boolValue))
+                ? boolValue : (previous ? previous.supportsQuadrantLayout : NO);
             boolValue = false;
-            api->CanRouteInputs(&boolValue);
-            multiview.canRouteInputs = boolValue;
-            BMDSwitcherInputAvailability availability = (BMDSwitcherInputAvailability)0;
-            api->GetInputAvailabilityMask(&availability);
-            multiview.inputAvailabilityMask = (uint32_t)availability;
+            multiview.canRouteInputs = SUCCEEDED(api->CanRouteInputs(&boolValue))
+                ? boolValue : (previous ? previous.canRouteInputs : NO);
+            BMDSwitcherInputAvailability availability = (BMDSwitcherInputAvailability)(previous ? previous.inputAvailabilityMask : 0);
+            HRESULT availabilityResult = api->GetInputAvailabilityMask(&availability);
+            multiview.inputAvailabilityMask = SUCCEEDED(availabilityResult)
+                ? (uint32_t)availability : (previous ? previous.inputAvailabilityMask : 0);
             boolValue = false;
-            api->SupportsVuMeters(&boolValue);
-            multiview.supportsVUMeters = boolValue;
+            multiview.supportsVUMeters = SUCCEEDED(api->SupportsVuMeters(&boolValue))
+                ? boolValue : (previous ? previous.supportsVUMeters : NO);
             boolValue = false;
-            api->CanAdjustVuMeterOpacity(&boolValue);
-            multiview.canAdjustVUMeterOpacity = boolValue;
-            double opacity = 1.0;
-            api->GetVuMeterOpacity(&opacity);
+            multiview.canAdjustVUMeterOpacity = SUCCEEDED(api->CanAdjustVuMeterOpacity(&boolValue))
+                ? boolValue : (previous ? previous.canAdjustVUMeterOpacity : NO);
+            double previousOpacity = previous ? previous.vuMeterOpacity : 1.0;
+            double opacity = previousOpacity;
+            HRESULT opacityResult = api->GetVuMeterOpacity(&opacity);
+            if (FAILED(opacityResult))
+                opacity = previousOpacity;
+            ReconcilePendingMultiviewOpacity(pending.vuMeterOpacity, opacityResult, &opacity);
             multiview.vuMeterOpacity = opacity;
             boolValue = false;
-            api->CanToggleSafeAreaEnabled(&boolValue);
-            multiview.canToggleSafeArea = boolValue;
-            uint32_t safeAreaTypes = 0;
-            api->GetSupportedSafeAreaTypes(&safeAreaTypes);
-            multiview.supportedSafeAreaTypes = safeAreaTypes;
+            multiview.canToggleSafeArea = SUCCEEDED(api->CanToggleSafeAreaEnabled(&boolValue))
+                ? boolValue : (previous ? previous.canToggleSafeArea : NO);
+            uint32_t safeAreaTypes = previous ? previous.supportedSafeAreaTypes : 0;
+            HRESULT safeAreaTypesResult = api->GetSupportedSafeAreaTypes(&safeAreaTypes);
+            multiview.supportedSafeAreaTypes = SUCCEEDED(safeAreaTypesResult)
+                ? safeAreaTypes : (previous ? previous.supportedSafeAreaTypes : 0);
             boolValue = false;
-            api->SupportsProgramPreviewSwap(&boolValue);
-            multiview.supportsProgramPreviewSwap = boolValue;
+            multiview.supportsProgramPreviewSwap = SUCCEEDED(api->SupportsProgramPreviewSwap(&boolValue))
+                ? boolValue : (previous ? previous.supportsProgramPreviewSwap : NO);
+            bool previousSwapped = previous ? previous.isProgramPreviewSwapped : false;
+            bool swapped = previousSwapped;
+            HRESULT swappedResult = api->GetProgramPreviewSwapped(&swapped);
+            if (FAILED(swappedResult))
+                swapped = previousSwapped;
+            ReconcilePendingMultiviewValue(pending.programPreviewSwapped, swappedResult, &swapped);
+            multiview.programPreviewSwapped = swapped;
             boolValue = false;
-            api->GetProgramPreviewSwapped(&boolValue);
-            multiview.programPreviewSwapped = boolValue;
-            boolValue = false;
-            api->CanChangeOverlayProperties(&boolValue);
-            multiview.canChangeOverlayProperties = boolValue;
+            multiview.canChangeOverlayProperties = SUCCEEDED(api->CanChangeOverlayProperties(&boolValue))
+                ? boolValue : (previous ? previous.canChangeOverlayProperties : NO);
 
-            uint32_t windowCount = 0;
-            api->GetWindowCount(&windowCount);
-            if (multiview.supportsQuadrantLayout)
-                windowCount = MIN(windowCount, (uint32_t)ActiveQuadrantWindowCount(multiview.layout));
-            windowCount = MIN(windowCount, 64U);
-            NSMutableArray<ATEMMultiviewWindowState *> *windows = [NSMutableArray arrayWithCapacity:windowCount];
-            for (uint32_t windowIndex = 0; windowIndex < windowCount; ++windowIndex) {
+            uint32_t totalWindowCount = previous ? (uint32_t)previous.totalWindowCount : 0;
+            if (FAILED(api->GetWindowCount(&totalWindowCount)))
+                totalWindowCount = previous ? (uint32_t)previous.totalWindowCount : 0;
+            totalWindowCount =
+                NormalizedMultiviewWindowCount(multiview.supportsQuadrantLayout,
+                                               totalWindowCount);
+            multiview.totalWindowCount = totalWindowCount;
+            EnsurePendingMultiviewWindowCount(pending, totalWindowCount);
+
+            std::vector<uint32_t> visibleWindowIndices;
+            if (multiview.supportsQuadrantLayout) {
+                visibleWindowIndices =
+                    VisibleQuadrantWindowIndices(multiview.layout);
+            } else {
+                for (uint32_t index = 0; index < totalWindowCount; ++index)
+                    visibleWindowIndices.push_back(index);
+            }
+            NSMutableArray<ATEMMultiviewWindowState *> *windows =
+                [NSMutableArray arrayWithCapacity:visibleWindowIndices.size()];
+            for (uint32_t windowIndex : visibleWindowIndices) {
+                ATEMMultiviewWindowState *previousWindow =
+                    MultiviewWindowStateForIndex(previous, windowIndex);
                 ATEMMultiviewWindowState *window = [[ATEMMultiviewWindowState alloc] init];
                 window.index = windowIndex;
-                BMDSwitcherInputId sourceID = -1;
-                api->GetWindowInput(windowIndex, &sourceID);
+                window.canRouteInput = multiview.canRouteInputs &&
+                    CanRouteMultiviewWindow(multiview.supportsQuadrantLayout, windowIndex);
+                BMDSwitcherInputId previousSourceID = previousWindow ? previousWindow.sourceID : -1;
+                BMDSwitcherInputId sourceID = previousSourceID;
+                HRESULT sourceResult = api->GetWindowInput(windowIndex, &sourceID);
+                if (FAILED(sourceResult))
+                    sourceID = previousSourceID;
+                ReconcilePendingMultiviewValue(pending.sources[windowIndex], sourceResult, &sourceID);
                 window.sourceID = sourceID;
                 boolValue = false;
-                api->CurrentInputSupportsVuMeter(windowIndex, &boolValue);
-                window.supportsVUMeter = boolValue;
+                window.supportsVUMeter = SUCCEEDED(api->CurrentInputSupportsVuMeter(windowIndex, &boolValue))
+                    ? boolValue : (previousWindow ? previousWindow.supportsVUMeter : NO);
+                bool previousVUMeterEnabled = previousWindow ? previousWindow.isVUMeterEnabled : false;
+                bool vuMeterEnabled = previousVUMeterEnabled;
+                HRESULT vuMeterResult = api->GetVuMeterEnabled(windowIndex, &vuMeterEnabled);
+                if (FAILED(vuMeterResult))
+                    vuMeterEnabled = previousVUMeterEnabled;
+                ReconcilePendingMultiviewValue(pending.vuMeters[windowIndex], vuMeterResult, &vuMeterEnabled);
+                window.vuMeterEnabled = vuMeterEnabled;
                 boolValue = false;
-                api->GetVuMeterEnabled(windowIndex, &boolValue);
-                window.vuMeterEnabled = boolValue;
+                window.supportsSafeArea = SUCCEEDED(api->CurrentInputSupportsSafeArea(windowIndex, &boolValue))
+                    ? boolValue : (previousWindow ? previousWindow.supportsSafeArea : NO);
+                bool previousSafeAreaEnabled = previousWindow ? previousWindow.isSafeAreaEnabled : false;
+                bool safeAreaEnabled = previousSafeAreaEnabled;
+                HRESULT safeAreaResult = api->GetSafeAreaEnabled(windowIndex, &safeAreaEnabled);
+                if (FAILED(safeAreaResult))
+                    safeAreaEnabled = previousSafeAreaEnabled;
+                ReconcilePendingMultiviewValue(pending.safeAreas[windowIndex], safeAreaResult, &safeAreaEnabled);
+                window.safeAreaEnabled = safeAreaEnabled;
+                BMDSwitcherMultiViewSafeAreaType safeAreaType = (BMDSwitcherMultiViewSafeAreaType)(previousWindow ? previousWindow.safeAreaType : (uint32_t)bmdSwitcherMultiViewSafeAreaTypeAspect16x9);
+                HRESULT safeAreaTypeResult = api->GetSafeAreaType(windowIndex, &safeAreaType);
+                window.safeAreaType = SUCCEEDED(safeAreaTypeResult)
+                    ? (uint32_t)safeAreaType : (previousWindow ? previousWindow.safeAreaType : (uint32_t)bmdSwitcherMultiViewSafeAreaTypeAspect16x9);
                 boolValue = false;
-                api->CurrentInputSupportsSafeArea(windowIndex, &boolValue);
-                window.supportsSafeArea = boolValue;
-                boolValue = false;
-                api->GetSafeAreaEnabled(windowIndex, &boolValue);
-                window.safeAreaEnabled = boolValue;
-                BMDSwitcherMultiViewSafeAreaType safeAreaType = bmdSwitcherMultiViewSafeAreaTypeAspect16x9;
-                api->GetSafeAreaType(windowIndex, &safeAreaType);
-                window.safeAreaType = (uint32_t)safeAreaType;
-                boolValue = false;
-                api->CurrentInputSupportsLabelOverlay(windowIndex, &boolValue);
-                window.supportsLabelOverlay = boolValue;
-                boolValue = false;
-                api->GetLabelVisible(windowIndex, &boolValue);
-                window.labelVisible = boolValue;
-                boolValue = false;
-                api->GetBorderVisible(windowIndex, &boolValue);
-                window.borderVisible = boolValue;
+                window.supportsLabelOverlay = SUCCEEDED(api->CurrentInputSupportsLabelOverlay(windowIndex, &boolValue))
+                    ? boolValue : (previousWindow ? previousWindow.supportsLabelOverlay : NO);
+                bool previousLabelVisible = previousWindow ? previousWindow.isLabelVisible : false;
+                bool labelVisible = previousLabelVisible;
+                HRESULT labelResult = api->GetLabelVisible(windowIndex, &labelVisible);
+                if (FAILED(labelResult))
+                    labelVisible = previousLabelVisible;
+                ReconcilePendingMultiviewValue(pending.labels[windowIndex], labelResult, &labelVisible);
+                window.labelVisible = labelVisible;
+                bool previousBorderVisible = previousWindow ? previousWindow.isBorderVisible : false;
+                bool borderVisible = previousBorderVisible;
+                HRESULT borderResult = api->GetBorderVisible(windowIndex, &borderVisible);
+                if (FAILED(borderResult))
+                    borderVisible = previousBorderVisible;
+                ReconcilePendingMultiviewValue(pending.borders[windowIndex], borderResult, &borderVisible);
+                window.borderVisible = borderVisible;
                 [windows addObject:window];
             }
             multiview.windows = windows;
             [multiviews addObject:multiview];
         }
+        _lastKnownMultiviews = [multiviews copy];
     }
 
     state.upstreamKeys = keys;
@@ -1053,13 +1809,313 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     state.auxOutputs = auxes;
     state.multiviews = multiviews;
 
+    NSString *targetAddress = [_targetAddressLocked copy] ?: @"";
     dispatch_async(dispatch_get_main_queue(), ^{
         if (self->_shutdown)
             return;
         self.latestState = state;
+        self.currentAddress = targetAddress;
+        [[NSNotificationCenter defaultCenter] postNotificationName:ATEMStateDidChangeNotification
+                                                            object:self];
         void (^handler)(ATEMState *) = self.stateHandler;
         if (handler)
             handler(state);
+    });
+}
+
+- (NSArray<ATEMHyperDeckClipState *> *)clipsForHyperDeckLocked:(IBMDSwitcherHyperDeck *)api
+                                                        deckID:(int64_t)deckID
+                                                     clipCount:(NSUInteger)clipCount
+{
+    if (!api)
+        return @[];
+
+    NSNumber *cacheKey = @(deckID);
+    NSArray<ATEMHyperDeckClipState *> *cachedClips = _hyperDeckClipCache[cacheKey];
+    NSNumber *cachedCount = _hyperDeckClipCacheCounts[cacheKey];
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    CFAbsoluteTime cachedAt = _hyperDeckClipCacheTimes[cacheKey].doubleValue;
+    BOOL countMatches = cachedCount && cachedCount.unsignedIntegerValue == clipCount;
+    if (cachedClips && countMatches && now - cachedAt < 2.0)
+        return cachedClips;
+
+    if (clipCount == 0) {
+        NSArray<ATEMHyperDeckClipState *> *empty = @[];
+        _hyperDeckClipCache[cacheKey] = empty;
+        _hyperDeckClipCacheCounts[cacheKey] = @0;
+        _hyperDeckClipCacheTimes[cacheKey] = @(now);
+        return empty;
+    }
+
+    IBMDSwitcherHyperDeckClipIterator *iterator = nullptr;
+    HRESULT iteratorResult = api->CreateIterator(IID_IBMDSwitcherHyperDeckClipIterator,
+                                                  (void **)&iterator);
+    if (FAILED(iteratorResult) || !iterator) {
+        // Never leave an actionable list behind after enumeration fails. Even when
+        // the count is unchanged, storage may have been replaced with new clip IDs.
+        NSArray<ATEMHyperDeckClipState *> *fallback = @[];
+        _hyperDeckClipCache[cacheKey] = fallback;
+        _hyperDeckClipCacheCounts[cacheKey] = @(clipCount);
+        _hyperDeckClipCacheTimes[cacheKey] = @(now);
+        return fallback;
+    }
+
+    NSMutableArray<ATEMHyperDeckClipState *> *clips =
+        [NSMutableArray arrayWithCapacity:MIN(clipCount, (NSUInteger)500)];
+    IBMDSwitcherHyperDeckClip *clipAPI = nullptr;
+    BOOL enumerationFailed = NO;
+    while (clips.count < 500) {
+        HRESULT nextResult = iterator->Next(&clipAPI);
+        if (nextResult == S_FALSE)
+            break;
+        if (FAILED(nextResult) || !clipAPI) {
+            enumerationFailed = YES;
+            break;
+        }
+        bool valid = false;
+        BMDSwitcherHyperDeckClipId clipID = -1;
+        BOOL includeClip = SUCCEEDED(clipAPI->IsValid(&valid)) && valid &&
+                           SUCCEEDED(clipAPI->GetId(&clipID));
+        if (includeClip) {
+            ATEMHyperDeckClipState *clip = [[ATEMHyperDeckClipState alloc] init];
+            clip.clipID = clipID;
+
+            bool infoAvailable = false;
+            clipAPI->IsInfoAvailable(&infoAvailable);
+            CFStringRef clipName = nullptr;
+            if (infoAvailable && SUCCEEDED(clipAPI->GetName(&clipName)) && clipName)
+                clip.name = StringFromOwnedCFString(clipName);
+            if (clip.name.length == 0)
+                clip.name = [NSString stringWithFormat:@"Clip %lld", clipID];
+
+            uint16_t hours = 0;
+            uint8_t minutes = 0, seconds = 0, frames = 0;
+            if (infoAvailable &&
+                SUCCEEDED(clipAPI->GetDuration(&hours, &minutes, &seconds, &frames)))
+                clip.duration = TimecodeString(hours, minutes, seconds, frames);
+            else
+                clip.duration = @"";
+            [clips addObject:clip];
+        }
+        clipAPI->Release();
+        clipAPI = nullptr;
+    }
+    if (clipAPI)
+        clipAPI->Release();
+    iterator->Release();
+
+    NSArray<ATEMHyperDeckClipState *> *result = enumerationFailed ? @[] : [clips copy];
+    _hyperDeckClipCache[cacheKey] = result;
+    _hyperDeckClipCacheCounts[cacheKey] = @(clipCount);
+    _hyperDeckClipCacheTimes[cacheKey] = @(now);
+    return result;
+}
+
+- (void)publishFeatureStatesLocked
+{
+    ATEMAudioState *audioState = [[ATEMAudioState alloc] init];
+    audioState.available = _demo || _fairlightMixer != nullptr;
+    audioState.demo = _demo;
+    audioState.masterLevels = @[];
+    audioState.masterPeakLevels = @[];
+    audioState.channels = @[];
+    audioState.masterFaderGain = 0;
+
+    NSMutableArray<ATEMAudioChannelState *> *channels = [NSMutableArray array];
+    if (_demo) {
+        audioState.statusMessage = @"Demo Fairlight mixer — live meters are simulated.";
+        audioState.masterFaderGain = _demoMasterAudioFader;
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        double masterLeft = -18.0 + 8.0 * std::sin(now * 2.7);
+        double masterRight = -20.0 + 7.0 * std::sin(now * 3.1 + 0.8);
+        audioState.masterLevels = @[@(masterLeft), @(masterRight)];
+        audioState.masterPeakLevels = @[@(MIN(0.0, masterLeft + 3.5)), @(MIN(0.0, masterRight + 3.0))];
+        for (NSUInteger index = 0; index < _demoAudioChannels.size(); ++index) {
+            const DemoAudioChannel &demoChannel = _demoAudioChannels[index];
+            ATEMAudioChannelState *channel = [[ATEMAudioChannelState alloc] init];
+            channel.inputID = demoChannel.inputID;
+            channel.sourceID = demoChannel.sourceID;
+            channel.name = _inputNamesByID[@(demoChannel.inputID)] ?: InputNameForID(_inputStates, demoChannel.inputID);
+            channel.active = YES;
+            channel.faderGain = demoChannel.faderGain;
+            channel.pan = demoChannel.pan;
+            channel.mixOption = demoChannel.mixOption;
+            channel.supportedMixOptions = ATEMAudioMixOptionOff |
+                                          ATEMAudioMixOptionOn |
+                                          ATEMAudioMixOptionAudioFollowVideo;
+            double phase = now * (2.0 + index * 0.17) + index * 0.63;
+            double levelLeft = MAX(-60.0, -28.0 + 13.0 * std::sin(phase) + demoChannel.faderGain * 0.35);
+            double levelRight = MAX(-60.0, -30.0 + 12.0 * std::sin(phase + 0.7) + demoChannel.faderGain * 0.35);
+            channel.levels = @[@(levelLeft), @(levelRight)];
+            channel.peakLevels = @[@(MIN(0.0, levelLeft + 3.0)), @(MIN(0.0, levelRight + 3.0))];
+            [channels addObject:channel];
+        }
+    } else if (_fairlightMixer) {
+        audioState.statusMessage = @"Fairlight audio levels and controls are live.";
+        double masterGain = 0;
+        _fairlightMixer->GetMasterOutFaderGain(&masterGain);
+        audioState.masterFaderGain = masterGain;
+        audioState.masterLevels = NumbersFromValues(_masterAudioLevels);
+        audioState.masterPeakLevels = NumbersFromValues(_masterAudioPeaks);
+        for (const FairlightSourceAPIRecord &record : _fairlightSources) {
+            if (!record.api)
+                continue;
+            ATEMAudioChannelState *channel = [[ATEMAudioChannelState alloc] init];
+            channel.inputID = record.inputID;
+            channel.sourceID = record.sourceID;
+            channel.name = record.name ?: _inputNamesByID[@(record.inputID)] ?: InputNameForID(_inputStates, record.inputID);
+            bool active = false;
+            double faderGain = 0;
+            double pan = 0;
+            BMDSwitcherFairlightAudioMixOption mixOption = bmdSwitcherFairlightAudioMixOptionOff;
+            BMDSwitcherFairlightAudioMixOption supported = (BMDSwitcherFairlightAudioMixOption)0;
+            record.api->IsActive(&active);
+            record.api->GetFaderGain(&faderGain);
+            record.api->GetPan(&pan);
+            record.api->GetMixOption(&mixOption);
+            record.api->GetSupportedMixOptions(&supported);
+            channel.active = active;
+            channel.faderGain = faderGain;
+            channel.pan = pan;
+            channel.mixOption = (ATEMAudioMixOption)(NSUInteger)mixOption;
+            channel.supportedMixOptions = (NSUInteger)supported;
+            channel.levels = NumbersFromValues(record.levels);
+            channel.peakLevels = NumbersFromValues(record.peaks);
+            [channels addObject:channel];
+        }
+    } else {
+        audioState.statusMessage = _switcher
+            ? @"This switcher does not expose a Fairlight audio mixer."
+            : @"Connect an ATEM to use its Fairlight audio mixer.";
+    }
+    audioState.channels = channels;
+
+    NSMutableArray<ATEMHyperDeckState *> *hyperDeckStates = [NSMutableArray array];
+    if (_demo) {
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        for (NSUInteger index = 0; index < _demoHyperDecks.size(); ++index) {
+            const DemoHyperDeck &demoDeck = _demoHyperDecks[index];
+            ATEMHyperDeckState *deck = [[ATEMHyperDeckState alloc] init];
+            deck.deckID = demoDeck.deckID;
+            deck.name = [NSString stringWithFormat:@"HyperDeck %lu", (unsigned long)index + 1];
+            deck.modelName = index == 0 ? @"HyperDeck Studio HD Mini — Demo" : @"Unconfigured Slot";
+            deck.networkAddress = demoDeck.address ?: @"";
+            deck.switcherInputID = demoDeck.switcherInputID;
+            deck.connectionStatus = demoDeck.connectionStatus;
+            deck.remoteAccessEnabled = demoDeck.connectionStatus == ATEMHyperDeckConnectionStatusConnected;
+            deck.playerState = demoDeck.playerState;
+            deck.currentClip = demoDeck.currentClip;
+            if (index == 0) {
+                NSArray<NSDictionary<NSString *, id> *> *demoClipData = @[
+                    @{@"id": @10, @"name": @"OPENING ROLL", @"duration": @"00:00:18:12"},
+                    @{@"id": @42, @"name": @"INTERVIEW A", @"duration": @"00:03:24:08"},
+                    @{@"id": @105, @"name": @"B-ROLL SELECTS", @"duration": @"00:01:47:19"},
+                    @{@"id": @9001, @"name": @"CLOSING LOOP", @"duration": @"00:00:30:00"},
+                ];
+                NSMutableArray<ATEMHyperDeckClipState *> *demoClips =
+                    [NSMutableArray arrayWithCapacity:demoClipData.count];
+                for (NSDictionary<NSString *, id> *clipData in demoClipData) {
+                    ATEMHyperDeckClipState *clip = [[ATEMHyperDeckClipState alloc] init];
+                    clip.clipID = [clipData[@"id"] longLongValue];
+                    clip.name = clipData[@"name"];
+                    clip.duration = clipData[@"duration"];
+                    [demoClips addObject:clip];
+                }
+                deck.clips = demoClips;
+                deck.clipCount = demoClips.count;
+            } else {
+                deck.clips = @[];
+                deck.clipCount = 0;
+            }
+            NSUInteger totalFrames = (NSUInteger)fmod(now * 25.0, 25.0 * 60.0 * 60.0);
+            deck.timecode = TimecodeString((uint16_t)(totalFrames / (25 * 3600)),
+                                           (uint8_t)((totalFrames / (25 * 60)) % 60),
+                                           (uint8_t)((totalFrames / 25) % 60),
+                                           (uint8_t)(totalFrames % 25));
+            deck.recordTimeRemaining = @"01:42:18:00";
+            deck.loopedPlayback = demoDeck.loopedPlayback;
+            deck.singleClipPlayback = demoDeck.singleClipPlayback;
+            deck.autoRollOnTake = demoDeck.autoRollOnTake;
+            deck.autoRollFrameDelay = demoDeck.autoRollFrameDelay;
+            deck.shuttleSpeed = demoDeck.shuttleSpeed;
+            [hyperDeckStates addObject:deck];
+        }
+    } else {
+        for (NSUInteger index = 0; index < _hyperDeckAPIs.size(); ++index) {
+            IBMDSwitcherHyperDeck *api = _hyperDeckAPIs[index];
+            ATEMHyperDeckState *deck = [[ATEMHyperDeckState alloc] init];
+            BMDSwitcherHyperDeckId deckID = (BMDSwitcherHyperDeckId)index;
+            api->GetId(&deckID);
+            deck.deckID = deckID;
+            deck.name = [NSString stringWithFormat:@"HyperDeck %lu", (unsigned long)index + 1];
+            CFStringRef model = nullptr;
+            if (SUCCEEDED(api->GetModelName(&model)) && model)
+                deck.modelName = StringFromOwnedCFString(model);
+            else
+                deck.modelName = @"HyperDeck Slot";
+            uint32_t address = 0;
+            api->GetNetworkAddress(&address);
+            deck.networkAddress = UnpackHyperDeckAddress(address);
+            BMDSwitcherInputId inputID = 0;
+            api->GetSwitcherInput(&inputID);
+            deck.switcherInputID = inputID;
+            BMDSwitcherHyperDeckConnectionStatus status = bmdSwitcherHyperDeckConnectionStatusNotConnected;
+            api->GetConnectionStatus(&status);
+            deck.connectionStatus = AppHyperDeckConnectionStatus(status);
+            bool boolValue = false;
+            api->IsRemoteAccessEnabled(&boolValue);
+            deck.remoteAccessEnabled = boolValue;
+            BMDSwitcherHyperDeckPlayerState playerState = bmdSwitcherHyperDeckStateUnknown;
+            api->GetPlayerState(&playerState);
+            deck.playerState = AppHyperDeckPlayerState(playerState);
+            BMDSwitcherHyperDeckClipId clipID = -1;
+            api->GetCurrentClip(&clipID);
+            deck.currentClip = clipID;
+            uint32_t clipCount = 0;
+            api->GetClipCount(&clipCount);
+            deck.clipCount = clipCount;
+            deck.clips = [self clipsForHyperDeckLocked:api deckID:deckID clipCount:clipCount];
+            uint16_t hours = 0;
+            uint8_t minutes = 0, seconds = 0, frames = 0;
+            if (SUCCEEDED(api->GetCurrentTimelineTime(&hours, &minutes, &seconds, &frames)))
+                deck.timecode = TimecodeString(hours, minutes, seconds, frames);
+            else
+                deck.timecode = @"--:--:--:--";
+            hours = 0; minutes = 0; seconds = 0; frames = 0;
+            if (SUCCEEDED(api->GetEstimatedRecordTimeRemaining(&hours, &minutes, &seconds, &frames)))
+                deck.recordTimeRemaining = TimecodeString(hours, minutes, seconds, frames);
+            else
+                deck.recordTimeRemaining = @"--:--:--:--";
+            boolValue = false;
+            api->GetLoopedPlayback(&boolValue);
+            deck.loopedPlayback = boolValue;
+            boolValue = false;
+            api->GetSingleClipPlayback(&boolValue);
+            deck.singleClipPlayback = boolValue;
+            boolValue = false;
+            api->GetAutoRollOnTake(&boolValue);
+            deck.autoRollOnTake = boolValue;
+            uint16_t frameDelay = 0;
+            api->GetAutoRollOnTakeFrameDelay(&frameDelay);
+            deck.autoRollFrameDelay = frameDelay;
+            int32_t shuttleSpeed = 0;
+            api->GetShuttleSpeed(&shuttleSpeed);
+            deck.shuttleSpeed = shuttleSpeed;
+            [hyperDeckStates addObject:deck];
+        }
+    }
+
+    NSString *address = [_targetAddressLocked copy] ?: @"";
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self->_shutdown)
+            return;
+        self.latestAudioState = audioState;
+        self.latestHyperDeckStates = hyperDeckStates;
+        self.currentAddress = address;
+        [[NSNotificationCenter defaultCenter] postNotificationName:ATEMAudioStateDidChangeNotification
+                                                            object:self];
+        [[NSNotificationCenter defaultCenter] postNotificationName:ATEMHyperDeckStateDidChangeNotification
+                                                            object:self];
     });
 }
 
@@ -1241,8 +2297,14 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     dispatch_async(_controlQueue, ^{
         if (self->_demo && index < self->_demoMultiviews.size())
             self->_demoMultiviews[index].layout = layout;
-        else if (index < self->_multiviewAPIs.size())
-            self->_multiviewAPIs[index]->SetLayout((BMDSwitcherMultiViewLayout)layout);
+        else if (index < self->_multiviewAPIs.size()) {
+            HRESULT result = self->_multiviewAPIs[index]->SetLayout((BMDSwitcherMultiViewLayout)layout);
+            if (result == S_OK) {
+                if (self->_pendingMultiviews.size() <= index)
+                    self->_pendingMultiviews.resize(index + 1);
+                MarkPendingMultiviewValue(self->_pendingMultiviews[index].layout, layout);
+            }
+        }
         [self publishStateLocked];
     });
 }
@@ -1252,8 +2314,14 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     dispatch_async(_controlQueue, ^{
         if (self->_demo && index < self->_demoMultiviews.size())
             self->_demoMultiviews[index].programPreviewSwapped = swapped;
-        else if (index < self->_multiviewAPIs.size())
-            self->_multiviewAPIs[index]->SetProgramPreviewSwapped(swapped);
+        else if (index < self->_multiviewAPIs.size()) {
+            HRESULT result = self->_multiviewAPIs[index]->SetProgramPreviewSwapped(swapped);
+            if (result == S_OK) {
+                if (self->_pendingMultiviews.size() <= index)
+                    self->_pendingMultiviews.resize(index + 1);
+                MarkPendingMultiviewValue(self->_pendingMultiviews[index].programPreviewSwapped, (bool)swapped);
+            }
+        }
         [self publishStateLocked];
     });
 }
@@ -1264,8 +2332,14 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     dispatch_async(_controlQueue, ^{
         if (self->_demo && index < self->_demoMultiviews.size())
             self->_demoMultiviews[index].vuMeterOpacity = clamped;
-        else if (index < self->_multiviewAPIs.size())
-            self->_multiviewAPIs[index]->SetVuMeterOpacity(clamped);
+        else if (index < self->_multiviewAPIs.size()) {
+            HRESULT result = self->_multiviewAPIs[index]->SetVuMeterOpacity(clamped);
+            if (result == S_OK) {
+                if (self->_pendingMultiviews.size() <= index)
+                    self->_pendingMultiviews.resize(index + 1);
+                MarkPendingMultiviewValue(self->_pendingMultiviews[index].vuMeterOpacity, clamped);
+            }
+        }
         [self publishStateLocked];
     });
 }
@@ -1275,8 +2349,21 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     dispatch_async(_controlQueue, ^{
         if (self->_demo && index < self->_demoMultiviews.size() && window < self->_demoMultiviews[index].sources.size())
             self->_demoMultiviews[index].sources[window] = sourceID;
-        else if (index < self->_multiviewAPIs.size())
-            self->_multiviewAPIs[index]->SetWindowInput((uint32_t)window, sourceID);
+        else if (index < self->_multiviewAPIs.size()) {
+            BOOL supportsQuadrantLayout = index < self->_lastKnownMultiviews.count
+                ? self->_lastKnownMultiviews[index].supportsQuadrantLayout : NO;
+            if (!CanRouteMultiviewWindow(supportsQuadrantLayout, window)) {
+                [self publishStateLocked];
+                return;
+            }
+            HRESULT result = self->_multiviewAPIs[index]->SetWindowInput((uint32_t)window, sourceID);
+            if (result == S_OK) {
+                if (self->_pendingMultiviews.size() <= index)
+                    self->_pendingMultiviews.resize(index + 1);
+                EnsurePendingMultiviewWindowCount(self->_pendingMultiviews[index], window + 1);
+                MarkPendingMultiviewValue(self->_pendingMultiviews[index].sources[window], sourceID);
+            }
+        }
         [self publishStateLocked];
     });
 }
@@ -1286,8 +2373,15 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     dispatch_async(_controlQueue, ^{
         if (self->_demo && index < self->_demoMultiviews.size() && window < self->_demoMultiviews[index].vuMeters.size())
             self->_demoMultiviews[index].vuMeters[window] = enabled;
-        else if (index < self->_multiviewAPIs.size())
-            self->_multiviewAPIs[index]->SetVuMeterEnabled((uint32_t)window, enabled);
+        else if (index < self->_multiviewAPIs.size()) {
+            HRESULT result = self->_multiviewAPIs[index]->SetVuMeterEnabled((uint32_t)window, enabled);
+            if (result == S_OK) {
+                if (self->_pendingMultiviews.size() <= index)
+                    self->_pendingMultiviews.resize(index + 1);
+                EnsurePendingMultiviewWindowCount(self->_pendingMultiviews[index], window + 1);
+                MarkPendingMultiviewValue(self->_pendingMultiviews[index].vuMeters[window], (bool)enabled);
+            }
+        }
         [self publishStateLocked];
     });
 }
@@ -1297,8 +2391,15 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     dispatch_async(_controlQueue, ^{
         if (self->_demo && index < self->_demoMultiviews.size() && window < self->_demoMultiviews[index].safeAreas.size())
             self->_demoMultiviews[index].safeAreas[window] = enabled;
-        else if (index < self->_multiviewAPIs.size())
-            self->_multiviewAPIs[index]->SetSafeAreaEnabled((uint32_t)window, enabled);
+        else if (index < self->_multiviewAPIs.size()) {
+            HRESULT result = self->_multiviewAPIs[index]->SetSafeAreaEnabled((uint32_t)window, enabled);
+            if (result == S_OK) {
+                if (self->_pendingMultiviews.size() <= index)
+                    self->_pendingMultiviews.resize(index + 1);
+                EnsurePendingMultiviewWindowCount(self->_pendingMultiviews[index], window + 1);
+                MarkPendingMultiviewValue(self->_pendingMultiviews[index].safeAreas[window], (bool)enabled);
+            }
+        }
         [self publishStateLocked];
     });
 }
@@ -1308,8 +2409,15 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     dispatch_async(_controlQueue, ^{
         if (self->_demo && index < self->_demoMultiviews.size() && window < self->_demoMultiviews[index].labels.size())
             self->_demoMultiviews[index].labels[window] = visible;
-        else if (index < self->_multiviewAPIs.size())
-            self->_multiviewAPIs[index]->SetLabelVisible((uint32_t)window, visible);
+        else if (index < self->_multiviewAPIs.size()) {
+            HRESULT result = self->_multiviewAPIs[index]->SetLabelVisible((uint32_t)window, visible);
+            if (result == S_OK) {
+                if (self->_pendingMultiviews.size() <= index)
+                    self->_pendingMultiviews.resize(index + 1);
+                EnsurePendingMultiviewWindowCount(self->_pendingMultiviews[index], window + 1);
+                MarkPendingMultiviewValue(self->_pendingMultiviews[index].labels[window], (bool)visible);
+            }
+        }
         [self publishStateLocked];
     });
 }
@@ -1319,9 +2427,379 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     dispatch_async(_controlQueue, ^{
         if (self->_demo && index < self->_demoMultiviews.size() && window < self->_demoMultiviews[index].borders.size())
             self->_demoMultiviews[index].borders[window] = visible;
-        else if (index < self->_multiviewAPIs.size())
-            self->_multiviewAPIs[index]->SetBorderVisible((uint32_t)window, visible);
+        else if (index < self->_multiviewAPIs.size()) {
+            HRESULT result = self->_multiviewAPIs[index]->SetBorderVisible((uint32_t)window, visible);
+            if (result == S_OK) {
+                if (self->_pendingMultiviews.size() <= index)
+                    self->_pendingMultiviews.resize(index + 1);
+                EnsurePendingMultiviewWindowCount(self->_pendingMultiviews[index], window + 1);
+                MarkPendingMultiviewValue(self->_pendingMultiviews[index].borders[window], (bool)visible);
+            }
+        }
         [self publishStateLocked];
+    });
+}
+
+- (void)setMultiview:(NSUInteger)index allLabelsVisible:(BOOL)visible
+{
+    dispatch_async(_controlQueue, ^{
+        if (self->_demo && index < self->_demoMultiviews.size()) {
+            for (NSUInteger window = 0; window < self->_demoMultiviews[index].labels.size(); ++window)
+                self->_demoMultiviews[index].labels[window] = visible;
+        } else if (index < self->_multiviewAPIs.size()) {
+            IBMDSwitcherMultiView *api = self->_multiviewAPIs[index];
+            uint32_t windowCount = index < self->_lastKnownMultiviews.count
+                ? (uint32_t)self->_lastKnownMultiviews[index].totalWindowCount : 0;
+            if (FAILED(api->GetWindowCount(&windowCount)))
+                windowCount = index < self->_lastKnownMultiviews.count
+                    ? (uint32_t)self->_lastKnownMultiviews[index].totalWindowCount : 0;
+            BOOL supportsQuadrantLayout = index < self->_lastKnownMultiviews.count
+                ? self->_lastKnownMultiviews[index].supportsQuadrantLayout : NO;
+            windowCount =
+                NormalizedMultiviewWindowCount(supportsQuadrantLayout, windowCount);
+            if (self->_pendingMultiviews.size() <= index)
+                self->_pendingMultiviews.resize(index + 1);
+            EnsurePendingMultiviewWindowCount(self->_pendingMultiviews[index], windowCount);
+            for (uint32_t window = 0; window < windowCount; ++window) {
+                if (api->SetLabelVisible(window, visible) == S_OK)
+                    MarkPendingMultiviewValue(self->_pendingMultiviews[index].labels[window], (bool)visible);
+            }
+        }
+        [self publishStateLocked];
+    });
+}
+
+- (void)setMultiview:(NSUInteger)index allBordersVisible:(BOOL)visible
+{
+    dispatch_async(_controlQueue, ^{
+        if (self->_demo && index < self->_demoMultiviews.size()) {
+            for (NSUInteger window = 0; window < self->_demoMultiviews[index].borders.size(); ++window)
+                self->_demoMultiviews[index].borders[window] = visible;
+        } else if (index < self->_multiviewAPIs.size()) {
+            IBMDSwitcherMultiView *api = self->_multiviewAPIs[index];
+            uint32_t windowCount = index < self->_lastKnownMultiviews.count
+                ? (uint32_t)self->_lastKnownMultiviews[index].totalWindowCount : 0;
+            if (FAILED(api->GetWindowCount(&windowCount)))
+                windowCount = index < self->_lastKnownMultiviews.count
+                    ? (uint32_t)self->_lastKnownMultiviews[index].totalWindowCount : 0;
+            BOOL supportsQuadrantLayout = index < self->_lastKnownMultiviews.count
+                ? self->_lastKnownMultiviews[index].supportsQuadrantLayout : NO;
+            windowCount =
+                NormalizedMultiviewWindowCount(supportsQuadrantLayout, windowCount);
+            if (self->_pendingMultiviews.size() <= index)
+                self->_pendingMultiviews.resize(index + 1);
+            EnsurePendingMultiviewWindowCount(self->_pendingMultiviews[index], windowCount);
+            for (uint32_t window = 0; window < windowCount; ++window) {
+                if (api->SetBorderVisible(window, visible) == S_OK)
+                    MarkPendingMultiviewValue(self->_pendingMultiviews[index].borders[window], (bool)visible);
+            }
+        }
+        [self publishStateLocked];
+    });
+}
+
+- (void)setAudioInput:(int64_t)inputID source:(int64_t)sourceID faderGain:(double)gain
+{
+    dispatch_async(_controlQueue, ^{
+        if (self->_demo) {
+            for (DemoAudioChannel &channel : self->_demoAudioChannels)
+                if (channel.inputID == inputID && channel.sourceID == sourceID)
+                    channel.faderGain = gain;
+        } else {
+            for (FairlightSourceAPIRecord &record : self->_fairlightSources)
+                if (record.inputID == inputID && record.sourceID == sourceID && record.api)
+                    record.api->SetFaderGain(gain);
+        }
+    });
+}
+
+- (void)setAudioInput:(int64_t)inputID source:(int64_t)sourceID pan:(double)pan
+{
+    dispatch_async(_controlQueue, ^{
+        if (self->_demo) {
+            for (DemoAudioChannel &channel : self->_demoAudioChannels)
+                if (channel.inputID == inputID && channel.sourceID == sourceID)
+                    channel.pan = pan;
+        } else {
+            for (FairlightSourceAPIRecord &record : self->_fairlightSources)
+                if (record.inputID == inputID && record.sourceID == sourceID && record.api)
+                    record.api->SetPan(pan);
+        }
+    });
+}
+
+- (void)setAudioInput:(int64_t)inputID source:(int64_t)sourceID mixOption:(ATEMAudioMixOption)mixOption
+{
+    dispatch_async(_controlQueue, ^{
+        if (self->_demo) {
+            for (DemoAudioChannel &channel : self->_demoAudioChannels)
+                if (channel.inputID == inputID && channel.sourceID == sourceID)
+                    channel.mixOption = mixOption;
+        } else {
+            for (FairlightSourceAPIRecord &record : self->_fairlightSources)
+                if (record.inputID == inputID && record.sourceID == sourceID && record.api)
+                    record.api->SetMixOption((BMDSwitcherFairlightAudioMixOption)mixOption);
+        }
+        [self publishFeatureStatesLocked];
+    });
+}
+
+- (void)setAudioMasterFaderGain:(double)gain
+{
+    dispatch_async(_controlQueue, ^{
+        if (self->_demo)
+            self->_demoMasterAudioFader = gain;
+        else if (self->_fairlightMixer)
+            self->_fairlightMixer->SetMasterOutFaderGain(gain);
+    });
+}
+
+- (void)resetAudioPeakLevels
+{
+    dispatch_async(_controlQueue, ^{
+        if (self->_fairlightMixer)
+            self->_fairlightMixer->ResetAllPeakLevels();
+        self->_masterAudioPeaks.clear();
+        for (FairlightSourceAPIRecord &record : self->_fairlightSources)
+            record.peaks.clear();
+        [self publishFeatureStatesLocked];
+    });
+}
+
+- (void)setHyperDeck:(int64_t)deckID networkAddress:(NSString *)address
+{
+    NSString *trimmed = [address stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    dispatch_async(_controlQueue, ^{
+        if (self->_demo) {
+            for (DemoHyperDeck &deck : self->_demoHyperDecks) {
+                if (deck.deckID != deckID)
+                    continue;
+                deck.address = [trimmed copy];
+                deck.connectionStatus = trimmed.length
+                    ? ATEMHyperDeckConnectionStatusConnected
+                    : ATEMHyperDeckConnectionStatusNotConnected;
+            }
+        } else {
+            uint32_t packedAddress = 0;
+            if (trimmed.length && !PackHyperDeckAddress(trimmed, &packedAddress))
+                return;
+            for (IBMDSwitcherHyperDeck *api : self->_hyperDeckAPIs) {
+                BMDSwitcherHyperDeckId candidateID = -1;
+                api->GetId(&candidateID);
+                if (candidateID == deckID)
+                    api->SetNetworkAddress(packedAddress);
+            }
+        }
+        [self publishFeatureStatesLocked];
+    });
+}
+
+- (void)setHyperDeck:(int64_t)deckID switcherInput:(int64_t)inputID
+{
+    dispatch_async(_controlQueue, ^{
+        if (self->_demo) {
+            for (DemoHyperDeck &deck : self->_demoHyperDecks)
+                if (deck.deckID == deckID)
+                    deck.switcherInputID = inputID;
+        } else {
+            for (IBMDSwitcherHyperDeck *api : self->_hyperDeckAPIs) {
+                BMDSwitcherHyperDeckId candidateID = -1;
+                api->GetId(&candidateID);
+                if (candidateID == deckID)
+                    api->SetSwitcherInput(inputID);
+            }
+        }
+        [self publishFeatureStatesLocked];
+    });
+}
+
+- (void)playHyperDeck:(int64_t)deckID
+{
+    dispatch_async(_controlQueue, ^{
+        if (self->_demo) {
+            for (DemoHyperDeck &deck : self->_demoHyperDecks)
+                if (deck.deckID == deckID)
+                    deck.playerState = ATEMHyperDeckPlayerStatePlay;
+        } else {
+            for (IBMDSwitcherHyperDeck *api : self->_hyperDeckAPIs) {
+                BMDSwitcherHyperDeckId candidateID = -1;
+                api->GetId(&candidateID);
+                if (candidateID == deckID)
+                    api->Play();
+            }
+        }
+        [self publishFeatureStatesLocked];
+    });
+}
+
+- (void)recordHyperDeck:(int64_t)deckID
+{
+    dispatch_async(_controlQueue, ^{
+        if (self->_demo) {
+            for (DemoHyperDeck &deck : self->_demoHyperDecks)
+                if (deck.deckID == deckID)
+                    deck.playerState = ATEMHyperDeckPlayerStateRecord;
+        } else {
+            for (IBMDSwitcherHyperDeck *api : self->_hyperDeckAPIs) {
+                BMDSwitcherHyperDeckId candidateID = -1;
+                api->GetId(&candidateID);
+                if (candidateID == deckID)
+                    api->Record();
+            }
+        }
+        [self publishFeatureStatesLocked];
+    });
+}
+
+- (void)stopHyperDeck:(int64_t)deckID
+{
+    dispatch_async(_controlQueue, ^{
+        if (self->_demo) {
+            for (DemoHyperDeck &deck : self->_demoHyperDecks)
+                if (deck.deckID == deckID)
+                    deck.playerState = ATEMHyperDeckPlayerStateIdle;
+        } else {
+            for (IBMDSwitcherHyperDeck *api : self->_hyperDeckAPIs) {
+                BMDSwitcherHyperDeckId candidateID = -1;
+                api->GetId(&candidateID);
+                if (candidateID == deckID)
+                    api->Stop();
+            }
+        }
+        [self publishFeatureStatesLocked];
+    });
+}
+
+- (void)jogHyperDeck:(int64_t)deckID frames:(NSInteger)frames
+{
+    dispatch_async(_controlQueue, ^{
+        if (!self->_demo) {
+            for (IBMDSwitcherHyperDeck *api : self->_hyperDeckAPIs) {
+                BMDSwitcherHyperDeckId candidateID = -1;
+                api->GetId(&candidateID);
+                if (candidateID == deckID)
+                    api->Jog((int32_t)frames);
+            }
+        }
+        [self publishFeatureStatesLocked];
+    });
+}
+
+- (void)shuttleHyperDeck:(int64_t)deckID speed:(NSInteger)speedPercent
+{
+    dispatch_async(_controlQueue, ^{
+        if (self->_demo) {
+            for (DemoHyperDeck &deck : self->_demoHyperDecks) {
+                if (deck.deckID == deckID) {
+                    deck.shuttleSpeed = speedPercent;
+                    deck.playerState = ATEMHyperDeckPlayerStateShuttle;
+                }
+            }
+        } else {
+            for (IBMDSwitcherHyperDeck *api : self->_hyperDeckAPIs) {
+                BMDSwitcherHyperDeckId candidateID = -1;
+                api->GetId(&candidateID);
+                if (candidateID == deckID)
+                    api->Shuttle((int32_t)speedPercent);
+            }
+        }
+        [self publishFeatureStatesLocked];
+    });
+}
+
+- (void)setHyperDeck:(int64_t)deckID currentClip:(int64_t)clipID
+{
+    dispatch_async(_controlQueue, ^{
+        if (self->_demo) {
+            for (DemoHyperDeck &deck : self->_demoHyperDecks)
+                if (deck.deckID == deckID)
+                    deck.currentClip = clipID;
+        } else {
+            for (IBMDSwitcherHyperDeck *api : self->_hyperDeckAPIs) {
+                BMDSwitcherHyperDeckId candidateID = -1;
+                api->GetId(&candidateID);
+                if (candidateID == deckID)
+                    api->SetCurrentClip(clipID);
+            }
+        }
+        [self publishFeatureStatesLocked];
+    });
+}
+
+- (void)setHyperDeck:(int64_t)deckID loopedPlayback:(BOOL)enabled
+{
+    dispatch_async(_controlQueue, ^{
+        if (self->_demo) {
+            for (DemoHyperDeck &deck : self->_demoHyperDecks)
+                if (deck.deckID == deckID)
+                    deck.loopedPlayback = enabled;
+        } else {
+            for (IBMDSwitcherHyperDeck *api : self->_hyperDeckAPIs) {
+                BMDSwitcherHyperDeckId candidateID = -1;
+                api->GetId(&candidateID);
+                if (candidateID == deckID)
+                    api->SetLoopedPlayback(enabled);
+            }
+        }
+        [self publishFeatureStatesLocked];
+    });
+}
+
+- (void)setHyperDeck:(int64_t)deckID singleClipPlayback:(BOOL)enabled
+{
+    dispatch_async(_controlQueue, ^{
+        if (self->_demo) {
+            for (DemoHyperDeck &deck : self->_demoHyperDecks)
+                if (deck.deckID == deckID)
+                    deck.singleClipPlayback = enabled;
+        } else {
+            for (IBMDSwitcherHyperDeck *api : self->_hyperDeckAPIs) {
+                BMDSwitcherHyperDeckId candidateID = -1;
+                api->GetId(&candidateID);
+                if (candidateID == deckID)
+                    api->SetSingleClipPlayback(enabled);
+            }
+        }
+        [self publishFeatureStatesLocked];
+    });
+}
+
+- (void)setHyperDeck:(int64_t)deckID autoRollOnTake:(BOOL)enabled
+{
+    dispatch_async(_controlQueue, ^{
+        if (self->_demo) {
+            for (DemoHyperDeck &deck : self->_demoHyperDecks)
+                if (deck.deckID == deckID)
+                    deck.autoRollOnTake = enabled;
+        } else {
+            for (IBMDSwitcherHyperDeck *api : self->_hyperDeckAPIs) {
+                BMDSwitcherHyperDeckId candidateID = -1;
+                api->GetId(&candidateID);
+                if (candidateID == deckID)
+                    api->SetAutoRollOnTake(enabled);
+            }
+        }
+        [self publishFeatureStatesLocked];
+    });
+}
+
+- (void)setHyperDeck:(int64_t)deckID autoRollFrameDelay:(NSUInteger)frames
+{
+    dispatch_async(_controlQueue, ^{
+        uint16_t frameDelay = (uint16_t)MIN(frames, (NSUInteger)UINT16_MAX);
+        if (self->_demo) {
+            for (DemoHyperDeck &deck : self->_demoHyperDecks)
+                if (deck.deckID == deckID)
+                    deck.autoRollFrameDelay = frameDelay;
+        } else {
+            for (IBMDSwitcherHyperDeck *api : self->_hyperDeckAPIs) {
+                BMDSwitcherHyperDeckId candidateID = -1;
+                api->GetId(&candidateID);
+                if (candidateID == deckID)
+                    api->SetAutoRollOnTakeFrameDelay(frameDelay);
+            }
+        }
+        [self publishFeatureStatesLocked];
     });
 }
 
@@ -1334,6 +2812,10 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     if (_pollTimer) {
         dispatch_source_cancel(_pollTimer);
         _pollTimer = nil;
+    }
+    if (_featureTimer) {
+        dispatch_source_cancel(_featureTimer);
+        _featureTimer = nil;
     }
     dispatch_sync(_controlQueue, ^{
         [self disconnectLockedWithMessage:@""];
@@ -1349,6 +2831,10 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     if (_mixEffectBlockMonitor) {
         _mixEffectBlockMonitor->Release();
         _mixEffectBlockMonitor = nullptr;
+    }
+    if (_fairlightMixerMonitor) {
+        _fairlightMixerMonitor->Release();
+        _fairlightMixerMonitor = nullptr;
     }
 }
 
@@ -1379,6 +2865,48 @@ int ATEMRunSelfTest(void)
         if (AppTransitionStyle(bmdSwitcherTransitionStyleDVE) != ATEMTransitionStyleDVE)
             return 4;
         printf("transition mapping: ok\n");
+        uint32_t packedAddress = 0;
+        if (!PackHyperDeckAddress(@"192.168.1.42", &packedAddress) ||
+            packedAddress != 0x2A01A8C0U ||
+            ![UnpackHyperDeckAddress(packedAddress) isEqualToString:@"192.168.1.42"] ||
+            PackHyperDeckAddress(@"192.168.1.999", &packedAddress))
+            return 12;
+        printf("HyperDeck IPv4 packing: ok\n");
+        const std::vector<std::vector<uint32_t>> expectedQuadrantWindows = {
+            {0, 2, 8, 10},
+            {0, 1, 2, 4, 5, 8, 10},
+            {0, 2, 3, 6, 7, 8, 10},
+            {0, 1, 2, 3, 4, 5, 6, 7, 8, 10},
+            {0, 2, 8, 9, 10, 12, 13},
+            {0, 1, 2, 4, 5, 8, 9, 10, 12, 13},
+            {0, 2, 3, 6, 7, 8, 9, 10, 12, 13},
+            {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13},
+            {0, 2, 8, 10, 11, 14, 15},
+            {0, 1, 2, 4, 5, 8, 10, 11, 14, 15},
+            {0, 2, 3, 6, 7, 8, 10, 11, 14, 15},
+            {0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 14, 15},
+            {0, 2, 8, 9, 10, 11, 12, 13, 14, 15},
+            {0, 1, 2, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15},
+            {0, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+            {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+        };
+        for (uint32_t layoutMask = 0; layoutMask < expectedQuadrantWindows.size(); ++layoutMask) {
+            std::vector<uint32_t> actualWindows =
+                VisibleQuadrantWindowIndices((ATEMMultiviewLayout)layoutMask);
+            if (actualWindows != expectedQuadrantWindows[layoutMask] ||
+                actualWindows.size() != ActiveQuadrantWindowCount((ATEMMultiviewLayout)layoutMask))
+                return 14;
+        }
+        if (NormalizedMultiviewWindowCount(YES, 0) != 16 ||
+            NormalizedMultiviewWindowCount(YES, 4) != 16 ||
+            NormalizedMultiviewWindowCount(YES, 16) != 16 ||
+            NormalizedMultiviewWindowCount(NO, 10) != 10 ||
+            !CanRouteMultiviewWindow(YES, 0) ||
+            CanRouteMultiviewWindow(NO, 0) ||
+            CanRouteMultiviewWindow(NO, 1) ||
+            !CanRouteMultiviewWindow(NO, 2))
+            return 14;
+        printf("quadrant physical window mapping (all 16 layouts): ok\n");
 
         ATEMController *controller = [[ATEMController alloc] init];
         ATEMController *secondController = [[ATEMController alloc] init];
@@ -1393,12 +2921,21 @@ int ATEMRunSelfTest(void)
         [controller enterDemoMode];
         [secondController enterDemoMode];
         NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
-        while ((!observedState.isDemo || !secondObservedState.isDemo || observedState.inputs.count == 0) && deadline.timeIntervalSinceNow > 0)
+        while ((!observedState.isDemo || !secondObservedState.isDemo || observedState.inputs.count == 0 ||
+                !controller.latestAudioState.isAvailable || controller.latestHyperDeckStates.count != 2) &&
+               deadline.timeIntervalSinceNow > 0)
             [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
         if (!observedState.isDemo || observedState.inputs.count != 13 ||
             observedState.upstreamKeys.count != 4 || observedState.downstreamKeys.count != 2 ||
             observedState.multiviews.count != 2 || observedState.multiviews.firstObject.windows.count != 10 ||
-            !secondObservedState.isDemo) {
+            !secondObservedState.isDemo || !controller.latestAudioState.isAvailable ||
+            controller.latestAudioState.channels.count != 8 ||
+            controller.latestHyperDeckStates.count != 2 ||
+            controller.latestHyperDeckStates.firstObject.clipCount != 4 ||
+            controller.latestHyperDeckStates.firstObject.clips.count != 4 ||
+            controller.latestHyperDeckStates.firstObject.clips.firstObject.clipID != 10 ||
+            controller.latestHyperDeckStates.firstObject.clips[1].clipID != 42 ||
+            ![controller.latestHyperDeckStates.firstObject.clips.firstObject.name isEqualToString:@"OPENING ROLL"]) {
             [controller shutdown];
             [secondController shutdown];
             return 5;
@@ -1413,14 +2950,76 @@ int ATEMRunSelfTest(void)
             [secondController shutdown];
             return 6;
         }
+        for (NSUInteger window = 0; window < 16; ++window)
+            [controller setMultiview:0 window:window source:(int64_t)(window % 13) + 1];
+        for (uint32_t layoutMask = 0; layoutMask < expectedQuadrantWindows.size(); ++layoutMask) {
+            [controller setMultiview:0 layout:(ATEMMultiviewLayout)layoutMask];
+            deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+            while ((observedState.multiviews.firstObject.layout != (ATEMMultiviewLayout)layoutMask ||
+                    observedState.multiviews.firstObject.windows.count != expectedQuadrantWindows[layoutMask].size()) &&
+                   deadline.timeIntervalSinceNow > 0) {
+                [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                         beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
+            }
+            ATEMMultiviewState *layoutState = observedState.multiviews.firstObject;
+            BOOL layoutMatches = layoutState.layout == (ATEMMultiviewLayout)layoutMask &&
+                layoutState.totalWindowCount == 16 &&
+                layoutState.windows.count == expectedQuadrantWindows[layoutMask].size();
+            if (layoutMatches) {
+                for (NSUInteger position = 0; position < layoutState.windows.count; ++position) {
+                    ATEMMultiviewWindowState *window = layoutState.windows[position];
+                    NSUInteger expectedIndex = expectedQuadrantWindows[layoutMask][position];
+                    int64_t expectedSource = (int64_t)(expectedIndex % 13) + 1;
+                    if (window.index != expectedIndex || window.sourceID != expectedSource) {
+                        layoutMatches = NO;
+                        break;
+                    }
+                }
+            }
+            if (!layoutMatches) {
+                [controller shutdown];
+                [secondController shutdown];
+                return 15;
+            }
+        }
         [controller setMultiview:0 layout:(ATEMMultiviewLayout)0];
         deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
         while (observedState.multiviews.firstObject.windows.count != 4 && deadline.timeIntervalSinceNow > 0)
             [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
-        if (observedState.multiviews.firstObject.windows.count != 4) {
+        ATEMMultiviewState *fourWindowMultiview = observedState.multiviews.firstObject;
+        if (fourWindowMultiview.windows.count != 4 ||
+            fourWindowMultiview.totalWindowCount != 16 ||
+            fourWindowMultiview.windows[0].index != 0 ||
+            fourWindowMultiview.windows[1].index != 2 ||
+            fourWindowMultiview.windows[2].index != 8 ||
+            fourWindowMultiview.windows[3].index != 10) {
             [controller shutdown];
             [secondController shutdown];
             return 7;
+        }
+        [controller setMultiview:0 window:8 source:11];
+        [controller setMultiview:0 window:10 source:12];
+        deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+        while ((MultiviewWindowStateForIndex(observedState.multiviews.firstObject, 8).sourceID != 11 ||
+                MultiviewWindowStateForIndex(observedState.multiviews.firstObject, 10).sourceID != 12) &&
+               deadline.timeIntervalSinceNow > 0) {
+            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                     beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
+        }
+        if (MultiviewWindowStateForIndex(observedState.multiviews.firstObject, 8).sourceID != 11 ||
+            MultiviewWindowStateForIndex(observedState.multiviews.firstObject, 10).sourceID != 12) {
+            [controller shutdown];
+            [secondController shutdown];
+            return 7;
+        }
+        [controller setMultiview:0 allLabelsVisible:NO];
+        [controller setMultiview:0 allBordersVisible:NO];
+        deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+        while ((observedState.multiviews.firstObject.windows.firstObject.isLabelVisible ||
+                observedState.multiviews.firstObject.windows.firstObject.isBorderVisible) &&
+               deadline.timeIntervalSinceNow > 0) {
+            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                     beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
         }
         ATEMMultiviewLayout allQuadrants = (ATEMMultiviewLayout)(ATEMMultiviewLayoutTopLeftSmall |
                                                                  ATEMMultiviewLayoutTopRightSmall |
@@ -1435,6 +3034,8 @@ int ATEMRunSelfTest(void)
                 observedState.multiviews.firstObject.windows.count != 16 ||
                 observedState.multiviews.firstObject.windows[15].sourceID != 7 ||
                 observedState.multiviews.firstObject.windows.firstObject.isLabelVisible ||
+                observedState.multiviews.firstObject.windows[15].isLabelVisible ||
+                observedState.multiviews.firstObject.windows[15].isBorderVisible ||
                 observedState.multiviews.firstObject.vuMeterOpacity > 0.351) && deadline.timeIntervalSinceNow > 0) {
             [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
         }
@@ -1442,22 +3043,94 @@ int ATEMRunSelfTest(void)
             observedState.multiviews.firstObject.windows.count != 16 ||
             observedState.multiviews.firstObject.windows[15].sourceID != 7 ||
             observedState.multiviews.firstObject.windows.firstObject.isLabelVisible ||
+            observedState.multiviews.firstObject.windows[15].isLabelVisible ||
+            observedState.multiviews.firstObject.windows[15].isBorderVisible ||
             observedState.multiviews.firstObject.vuMeterOpacity > 0.351) {
             [controller shutdown];
             [secondController shutdown];
             return 8;
         }
+
+        ATEMMultiviewLayout multiview2Layout = ATEMMultiviewLayoutBottomRightSmall;
+        [controller setMultiview:1 layout:multiview2Layout];
+        [controller setMultiview:1 window:0 source:12];
+        [controller setMultiview:1 allLabelsVisible:NO];
+        [controller setMultiview:1 allBordersVisible:NO];
+        deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+        while ((observedState.multiviews[1].layout != multiview2Layout ||
+                observedState.multiviews[1].windows.firstObject.sourceID != 12 ||
+                observedState.multiviews[1].windows.firstObject.isLabelVisible ||
+                observedState.multiviews[1].windows.firstObject.isBorderVisible) && deadline.timeIntervalSinceNow > 0) {
+            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
+        }
+        ATEMMultiviewState *multiview1 = observedState.multiviews[0];
+        ATEMMultiviewState *multiview2 = observedState.multiviews[1];
+        BOOL multiview2OverlaysOff = YES;
+        for (ATEMMultiviewWindowState *window in multiview2.windows)
+            multiview2OverlaysOff &= !window.isLabelVisible && !window.isBorderVisible;
+        if (multiview1.layout != allQuadrants || multiview1.windows.count != 16 ||
+            multiview1.windows[15].sourceID != 7 || multiview1.vuMeterOpacity > 0.351 ||
+            multiview2.layout != multiview2Layout || multiview2.windows.firstObject.sourceID != 12 ||
+            !multiview2OverlaysOff) {
+            [controller shutdown];
+            [secondController shutdown];
+            return 9;
+        }
+
+        [controller setMultiview:0 allLabelsVisible:YES];
+        [controller setMultiview:0 allBordersVisible:YES];
+        deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+        while ((!observedState.multiviews[0].windows.firstObject.isLabelVisible ||
+                !observedState.multiviews[0].windows.firstObject.isBorderVisible) && deadline.timeIntervalSinceNow > 0) {
+            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
+        }
+        multiview1 = observedState.multiviews[0];
+        multiview2 = observedState.multiviews[1];
+        BOOL multiview1OverlaysOn = YES;
+        multiview2OverlaysOff = YES;
+        for (ATEMMultiviewWindowState *window in multiview1.windows)
+            multiview1OverlaysOn &= window.isLabelVisible && window.isBorderVisible;
+        for (ATEMMultiviewWindowState *window in multiview2.windows)
+            multiview2OverlaysOff &= !window.isLabelVisible && !window.isBorderVisible;
+        if (!multiview1OverlaysOn || !multiview2OverlaysOff) {
+            [controller shutdown];
+            [secondController shutdown];
+            return 10;
+        }
         if (secondObservedState.programInputID != 1 ||
             secondObservedState.multiviews.firstObject.layout != ATEMMultiviewLayoutProgramTop) {
             [controller shutdown];
             [secondController shutdown];
-            return 9;
+            return 11;
+        }
+        [controller setAudioInput:1 source:0 faderGain:-12.0];
+        [controller recordHyperDeck:1];
+        [controller setHyperDeck:1 currentClip:9001];
+        deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+        while ((controller.latestAudioState.channels.firstObject.faderGain > -11.99 ||
+                controller.latestHyperDeckStates.firstObject.playerState != ATEMHyperDeckPlayerStateRecord ||
+                controller.latestHyperDeckStates.firstObject.currentClip != 9001) &&
+               deadline.timeIntervalSinceNow > 0) {
+            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
+        }
+        if (controller.latestAudioState.channels.firstObject.faderGain > -11.99 ||
+            controller.latestAudioState.channels[1].faderGain < -4.01 ||
+            controller.latestHyperDeckStates.firstObject.playerState != ATEMHyperDeckPlayerStateRecord ||
+            controller.latestHyperDeckStates.firstObject.currentClip != 9001) {
+            [controller shutdown];
+            [secondController shutdown];
+            return 13;
         }
         [controller shutdown];
         [secondController shutdown];
         printf("asynchronous demo controller: ok\n");
         printf("independent dual sessions: ok\n");
-        printf("multiview configuration model: ok\n");
+        printf("multiview configuration model (all 16 layouts): ok\n");
+        printf("independent multiview outputs: ok\n");
+        printf("global multiview overlays: ok\n");
+        printf("Fairlight audio model: ok\n");
+        printf("HyperDeck transport model: ok\n");
+        printf("HyperDeck opaque clip IDs: ok\n");
         printf("self-test: passed\n");
         return 0;
     }
@@ -1487,7 +3160,10 @@ int ATEMPrintDiagnostics(void)
         printf("runtime version: %s\n", runtimeVersion.UTF8String);
         printf("independent switcher sessions: 2\n");
         printf("multiview configuration API: enabled\n");
-        printf("camera-control API touched: no\n");
+        printf("Fairlight audio API: enabled (10 Hz feature refresh)\n");
+        printf("ATEM-managed HyperDeck API: enabled (opaque clip IDs)\n");
+        printf("camera-control API in main process: no\n");
+        printf("isolated camera helper bundled: yes\n");
         return ATEMController.isRuntimeInstalled ? 0 : 1;
     }
 }
