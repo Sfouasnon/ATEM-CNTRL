@@ -66,6 +66,16 @@ typedef NS_ENUM(NSUInteger, ATEMHyperDeckPlayerState) {
 - (instancetype)init NS_UNAVAILABLE;
 @end
 
+@interface ATEMLabelTargetState : NSObject
+/// SDK input identifier. Output endpoints are also represented by IBMDSwitcherInput.
+@property(nonatomic, readonly) int64_t inputID;
+@property(nonatomic, copy, readonly) NSString *longName;
+@property(nonatomic, copy, readonly) NSString *shortName;
+/// Human-readable SDK port type, e.g. @"Camera/Input", @"Aux Output", or @"Multiview Output".
+@property(nonatomic, copy, readonly) NSString *typeName;
+@property(nonatomic, readonly, getter=isOutput) BOOL output;
+@end
+
 @interface ATEMKeyState : NSObject
 @property(nonatomic, readonly) NSUInteger index;
 @property(nonatomic, readonly, getter=isOnAir) BOOL onAir;
@@ -182,6 +192,17 @@ typedef NS_ENUM(NSUInteger, ATEMHyperDeckPlayerState) {
 @property(nonatomic, readonly) NSInteger shuttleSpeed;
 @end
 
+@interface ATEMVideoModeOption : NSObject
+/// Raw BMDSwitcherVideoMode value. Held as uint32_t so this header stays free of SDK types.
+@property(nonatomic, readonly) uint32_t rawMode;
+/// Resolution portion, e.g. @"1080p", @"2160p", @"NTSC 16:9".
+@property(nonatomic, copy, readonly) NSString *formatName;
+/// Frame rate portion, e.g. @"59.94". Empty when the mode has no separable rate.
+@property(nonatomic, copy, readonly) NSString *frameRateName;
+/// Combined label, e.g. @"1080p59.94".
+@property(nonatomic, copy, readonly) NSString *displayName;
+@end
+
 @interface ATEMState : NSObject
 @property(nonatomic, readonly, getter=isConnected) BOOL connected;
 @property(nonatomic, readonly, getter=isConnecting) BOOL connecting;
@@ -205,6 +226,14 @@ typedef NS_ENUM(NSUInteger, ATEMHyperDeckPlayerState) {
 @property(nonatomic, copy, readonly) NSArray<ATEMDownstreamKeyState *> *downstreamKeys;
 @property(nonatomic, copy, readonly) NSArray<ATEMAuxState *> *auxOutputs;
 @property(nonatomic, copy, readonly) NSArray<ATEMMultiviewState *> *multiviews;
+/// Every SDK endpoint whose long and short labels can be edited.
+@property(nonatomic, copy, readonly) NSArray<ATEMLabelTargetState *> *labelTargets;
+/// Raw BMDSwitcherVideoMode currently running on the switcher.
+@property(nonatomic, readonly) uint32_t videoMode;
+/// YES when the switcher reports more than one supported video mode.
+@property(nonatomic, readonly) BOOL canChangeVideoMode;
+/// Every mode the connected switcher accepts, in resolution then frame-rate order.
+@property(nonatomic, copy, readonly) NSArray<ATEMVideoModeOption *> *supportedVideoModes;
 @end
 
 @interface ATEMController : NSObject
@@ -233,6 +262,10 @@ typedef NS_ENUM(NSUInteger, ATEMHyperDeckPlayerState) {
 - (void)setDownstreamKey:(NSUInteger)index tied:(BOOL)tied;
 - (void)performDownstreamKeyAuto:(NSUInteger)index;
 - (void)setAuxOutput:(NSUInteger)index source:(int64_t)sourceID;
+/// Sets the switcher-stored long and short labels for an input or output endpoint.
+- (void)setLabelForInput:(int64_t)inputID longName:(NSString *)longName shortName:(NSString *)shortName;
+/// Changes the switcher-wide video standard. Disruptive: every output re-syncs.
+- (void)setVideoMode:(uint32_t)videoMode;
 - (void)setMultiview:(NSUInteger)index layout:(ATEMMultiviewLayout)layout;
 - (void)setMultiview:(NSUInteger)index programPreviewSwapped:(BOOL)swapped;
 - (void)setMultiview:(NSUInteger)index vuMeterOpacity:(double)opacity;

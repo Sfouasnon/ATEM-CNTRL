@@ -4,15 +4,18 @@
 #import "ColorWindowController.h"
 #import "ControlSurfaceWindowController.h"
 #import "HyperDeckWindowController.h"
+#import "LabelsWindowController.h"
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 @property(nonatomic, strong) NSArray<ATEMController *> *controllers;
 @property(nonatomic, strong) ControlSurfaceWindowController *windowController;
 @property(nonatomic, strong) AudioWindowController *audioWindowController;
 @property(nonatomic, strong) ColorWindowController *colorWindowController;
+@property(nonatomic, strong) LabelsWindowController *labelsWindowController;
 @property(nonatomic, strong) HyperDeckWindowController *hyperDeckWindowController;
 - (void)showAudioWindowForSession:(NSUInteger)sessionIndex;
 - (void)showColorWindowForSession:(NSUInteger)sessionIndex;
+- (void)showLabelsWindowForSession:(NSUInteger)sessionIndex;
 - (void)showHyperDeckWindowForSession:(NSUInteger)sessionIndex;
 @end
 
@@ -70,6 +73,10 @@
                                                   action:@selector(showHyperDeckWindow:)
                                            keyEquivalent:@"4"];
     hyperDeck.target = self;
+    NSMenuItem *labels = [windowMenu addItemWithTitle:@"Input & Output Labels"
+                                               action:@selector(showLabelsWindow:)
+                                        keyEquivalent:@"5"];
+    labels.target = self;
     [windowMenu addItem:NSMenuItem.separatorItem];
     [windowMenu addItemWithTitle:@"Bring All to Front" action:@selector(arrangeInFront:) keyEquivalent:@""];
     windowItem.submenu = windowMenu;
@@ -93,6 +100,8 @@
             [strongSelf showColorWindowForSession:sessionIndex];
         else if ([feature isEqualToString:@"hyperdeck"])
             [strongSelf showHyperDeckWindowForSession:sessionIndex];
+        else if ([feature isEqualToString:@"labels"])
+            [strongSelf showLabelsWindowForSession:sessionIndex];
     };
     [self.windowController showWindow:self];
     [self.windowController.window makeKeyAndOrderFront:self];
@@ -114,8 +123,9 @@
     if (renderIndex == NSNotFound) {
         NSArray<NSString *> *featureFlags = @[@"--render-audio-preview",
                                                @"--render-color-preview",
-                                               @"--render-hyperdeck-preview"];
-        NSArray<NSString *> *featureNames = @[@"audio", @"color", @"hyperdeck"];
+                                               @"--render-hyperdeck-preview",
+                                               @"--render-labels-preview"];
+        NSArray<NSString *> *featureNames = @[@"audio", @"color", @"hyperdeck", @"labels"];
         for (NSUInteger index = 0; index < featureFlags.count; ++index) {
             renderIndex = [arguments indexOfObject:featureFlags[index]];
             if (renderIndex != NSNotFound) {
@@ -138,12 +148,17 @@
             } else if ([feature isEqualToString:@"hyperdeck"]) {
                 [self showHyperDeckWindowForSession:0];
                 renderController = self.hyperDeckWindowController;
+            } else if ([feature isEqualToString:@"labels"]) {
+                [self showLabelsWindowForSession:0];
+                renderController = self.labelsWindowController;
             }
             void (^capture)(void) = ^{
                 NSView *contentView = renderController.window.contentView;
                 [contentView layoutSubtreeIfNeeded];
                 if (renderMultiview && renderController == self.windowController)
                     [self.windowController scrollMultiviewIntoView];
+                if ([feature isEqualToString:@"labels"])
+                    [self.labelsWindowController scrollOutputsIntoView];
                 NSBitmapImageRep *bitmap = [contentView bitmapImageRepForCachingDisplayInRect:contentView.bounds];
                 [contentView cacheDisplayInRect:contentView.bounds toBitmapImageRep:bitmap];
                 NSData *png = [bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
@@ -215,6 +230,21 @@
 {
     (void)sender;
     [self showHyperDeckWindowForSession:self.windowController.activeSessionIndex];
+}
+
+- (void)showLabelsWindowForSession:(NSUInteger)sessionIndex
+{
+    if (!self.labelsWindowController)
+        self.labelsWindowController = [[LabelsWindowController alloc] initWithControllers:self.controllers
+                                                                       initialSessionIndex:sessionIndex];
+    [self.labelsWindowController selectSessionIndex:sessionIndex];
+    [self showWindowController:self.labelsWindowController];
+}
+
+- (void)showLabelsWindow:(id)sender
+{
+    (void)sender;
+    [self showLabelsWindowForSession:self.windowController.activeSessionIndex];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender

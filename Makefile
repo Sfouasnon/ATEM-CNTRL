@@ -23,6 +23,7 @@ SOURCES := \
 	Sources/ControlSurfaceWindowController.mm \
 	Sources/AudioWindowController.mm \
 	Sources/ColorWindowController.mm \
+	Sources/LabelsWindowController.mm \
 	Sources/HyperDeckWindowController.mm
 
 CXX := xcrun clang++
@@ -30,7 +31,7 @@ CXXFLAGS := -std=c++17 -fobjc-arc -fblocks -Wall -Wextra -Wno-deprecated-declara
 	-arch arm64 -arch x86_64 -mmacosx-version-min=13.0 -I"$(SDK_INCLUDE)" -I"Sources"
 LDFLAGS := -framework Cocoa -framework CoreFoundation
 
-.PHONY: all build package run demo preview preview-multiview preview-audio preview-color preview-hyperdeck test diagnose clean verify requirements
+.PHONY: all build package run demo preview preview-multiview preview-audio preview-color preview-labels preview-hyperdeck test diagnose clean verify requirements
 
 all: build
 
@@ -70,6 +71,9 @@ preview-audio: build
 
 preview-color: build
 	"$(BINARY)" --demo --render-color-preview "$(BUILD_DIR)/color-preview.png"
+
+preview-labels: build
+	"$(BINARY)" --demo --render-labels-preview "$(BUILD_DIR)/labels-preview.png"
 
 preview-hyperdeck: build
 	"$(BINARY)" --demo --render-hyperdeck-preview "$(BUILD_DIR)/hyperdeck-preview.png"

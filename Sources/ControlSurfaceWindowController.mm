@@ -367,6 +367,10 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
 @property(nonatomic, strong) NSArray<ATEMControlButton *> *selectionButtons;
 @property(nonatomic, strong) NSTextField *rateField;
 @property(nonatomic, strong) NSStepper *rateStepper;
+/// Wall-clock deadline before which polled state must not overwrite the RATE
+/// controls. Without it the 250 ms poll snaps the field back to the pre-write
+/// value while the switcher round-trip is still in flight.
+@property(nonatomic) NSTimeInterval rateEchoSuppressUntil;
 @property(nonatomic, strong) NSStackView *upstreamKeyStack;
 @property(nonatomic, strong) NSMutableArray<ATEMIndexedButton *> *upstreamKeyButtons;
 
@@ -384,6 +388,15 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
 @property(nonatomic, strong) ATEMCardView *auxCard;
 @property(nonatomic, strong) NSStackView *auxStack;
 @property(nonatomic, strong) NSMutableArray<NSPopUpButton *> *auxPopups;
+
+@property(nonatomic, strong) NSPopUpButton *videoFormatPopup;
+@property(nonatomic, strong) NSPopUpButton *videoRatePopup;
+@property(nonatomic, strong) ATEMControlButton *videoApplyButton;
+@property(nonatomic, strong) NSTextField *videoModeLabel;
+@property(nonatomic, copy) NSArray<ATEMVideoModeOption *> *videoModeOptions;
+@property(nonatomic, copy) NSString *videoModeSignature;
+/// Last switcher video mode pushed into the popups. Sentinel forces a resync.
+@property(nonatomic) uint32_t syncedVideoMode;
 
 @property(nonatomic, strong) ATEMCardView *multiviewCard;
 @property(nonatomic, strong) NSStackView *multiviewStack;
@@ -530,6 +543,10 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
     self.state = nil;
     self.inputSignature = nil;
     self.multiviewSignature = nil;
+    // The other switcher may run a different standard and support a different set.
+    self.videoModeSignature = nil;
+    self.syncedVideoMode = UINT32_MAX;
+    self.rateEchoSuppressUntil = 0;
     [self updateSessionSelector];
     [self applyState:self.sessionStates[self.activeSessionIndex]];
 }
@@ -626,6 +643,11 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
     [transition.widthAnchor constraintEqualToConstant:250].active = YES;
     [tbar.widthAnchor constraintEqualToConstant:112].active = YES;
     [dsk.widthAnchor constraintGreaterThanOrEqualToConstant:360].active = YES;
+
+    NSView *videoStandard = [self buildVideoStandardCard];
+    [body addArrangedSubview:videoStandard];
+    [videoStandard.widthAnchor constraintEqualToAnchor:body.widthAnchor constant:-32].active = YES;
+    [videoStandard.heightAnchor constraintEqualToConstant:104].active = YES;
 
     self.auxCard = (ATEMCardView *)[self buildAuxCard];
     [body addArrangedSubview:self.auxCard];
@@ -797,6 +819,14 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
     hyperDeckButton.fillsWhenActive = NO;
     hyperDeckButton.toolTip = @"Configure and control HyperDecks through the active ATEM.";
     [header addSubview:hyperDeckButton];
+    ATEMControlButton *labelsButton = [[ATEMControlButton alloc] initWithTitle:@"LABELS"
+                                                                       target:self
+                                                                       action:@selector(featurePressed:)];
+    labelsButton.tag = 3;
+    labelsButton.activeColor = ThemePreview();
+    labelsButton.fillsWhenActive = NO;
+    labelsButton.toolTip = @"Edit switcher-stored input and output labels.";
+    [header addSubview:labelsButton];
 
     [NSLayoutConstraint activateConstraints:@[
         [brandLogo.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:18],
@@ -837,13 +867,13 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
         [addressLabel.topAnchor constraintEqualToAnchor:targetLabel.topAnchor],
         [self.addressField.trailingAnchor constraintEqualToAnchor:self.connectButton.leadingAnchor constant:-10],
         [self.addressField.topAnchor constraintEqualToAnchor:self.demoButton.topAnchor],
-        [self.addressField.widthAnchor constraintEqualToConstant:236],
+        [self.addressField.widthAnchor constraintEqualToConstant:200],
         [self.addressField.heightAnchor constraintEqualToAnchor:self.demoButton.heightAnchor],
 
         [statusPrefix.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:22],
         [statusPrefix.bottomAnchor constraintEqualToAnchor:header.bottomAnchor constant:-9],
         [self.statusLabel.leadingAnchor constraintEqualToAnchor:statusPrefix.trailingAnchor constant:10],
-        [self.statusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:audioButton.leadingAnchor constant:-14],
+        [self.statusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:labelsButton.leadingAnchor constant:-14],
         [self.statusLabel.centerYAnchor constraintEqualToAnchor:statusPrefix.centerYAnchor],
 
         [hyperDeckButton.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-20],
@@ -858,6 +888,10 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
         [audioButton.bottomAnchor constraintEqualToAnchor:hyperDeckButton.bottomAnchor],
         [audioButton.widthAnchor constraintEqualToConstant:76],
         [audioButton.heightAnchor constraintEqualToAnchor:hyperDeckButton.heightAnchor],
+        [labelsButton.trailingAnchor constraintEqualToAnchor:audioButton.leadingAnchor constant:-7],
+        [labelsButton.bottomAnchor constraintEqualToAnchor:hyperDeckButton.bottomAnchor],
+        [labelsButton.widthAnchor constraintEqualToConstant:76],
+        [labelsButton.heightAnchor constraintEqualToAnchor:hyperDeckButton.heightAnchor],
     ]];
     return header;
 }
@@ -990,6 +1024,9 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
     self.rateStepper.minValue = 1;
     self.rateStepper.maxValue = 250;
     self.rateStepper.increment = 1;
+    self.rateStepper.integerValue = 25;
+    self.rateStepper.valueWraps = NO;
+    self.rateStepper.autorepeat = YES;
     self.rateStepper.target = self;
     self.rateStepper.action = @selector(rateChanged:);
     [rateRow addArrangedSubview:self.rateStepper];
@@ -1016,6 +1053,55 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
     self.selectionButtons = selectionButtons;
     [content addArrangedSubview:selection];
     [selection.widthAnchor constraintEqualToAnchor:content.widthAnchor].active = YES;
+    return card;
+}
+
+- (NSView *)buildVideoStandardCard
+{
+    NSStackView *content = nil;
+    ATEMCardView *card = [self cardWithTitle:@"Video Standard" accentColor:ThemeViolet() content:&content];
+
+    NSStackView *row = [[NSStackView alloc] initWithFrame:NSZeroRect];
+    row.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    row.alignment = NSLayoutAttributeCenterY;
+    row.spacing = 8;
+
+    [row addArrangedSubview:Label(@"FORMAT", 9, NSFontWeightSemibold, ThemeMuted())];
+    self.videoFormatPopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    StylePopup(self.videoFormatPopup);
+    self.videoFormatPopup.target = self;
+    self.videoFormatPopup.action = @selector(videoFormatChanged:);
+    [row addArrangedSubview:self.videoFormatPopup];
+    [self.videoFormatPopup.widthAnchor constraintEqualToConstant:130].active = YES;
+
+    [row addArrangedSubview:Label(@"FRAME RATE", 9, NSFontWeightSemibold, ThemeMuted())];
+    self.videoRatePopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    StylePopup(self.videoRatePopup);
+    self.videoRatePopup.target = self;
+    self.videoRatePopup.action = @selector(videoRateChanged:);
+    [row addArrangedSubview:self.videoRatePopup];
+    [self.videoRatePopup.widthAnchor constraintEqualToConstant:100].active = YES;
+
+    self.videoApplyButton = [[ATEMControlButton alloc] initWithTitle:@"SET STANDARD"
+                                                              target:self
+                                                              action:@selector(videoStandardApplyPressed:)];
+    self.videoApplyButton.activeColor = ThemeViolet();
+    self.videoApplyButton.fillsWhenActive = NO;
+    [row addArrangedSubview:self.videoApplyButton];
+    [self.videoApplyButton.widthAnchor constraintEqualToConstant:130].active = YES;
+
+    NSView *spacer = [[NSView alloc] initWithFrame:NSZeroRect];
+    [spacer setContentHuggingPriority:NSLayoutPriorityDefaultLow - 1
+                       forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [row addArrangedSubview:spacer];
+    [content addArrangedSubview:row];
+    [row.widthAnchor constraintEqualToAnchor:content.widthAnchor].active = YES;
+
+    self.videoModeLabel = Label(@"Connect to read the switcher video standard.", 10, NSFontWeightRegular, ThemeSecondary());
+    [content addArrangedSubview:self.videoModeLabel];
+
+    self.videoModeOptions = @[];
+    self.syncedVideoMode = UINT32_MAX;
     return card;
 }
 
@@ -1719,8 +1805,8 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
         if (index > 0)
             button.enabled = state.isConnected && state.upstreamKeys.count >= index;
     }];
-    self.rateField.integerValue = state.transitionRate;
-    self.rateStepper.integerValue = state.transitionRate;
+    [self applyTransitionRate:state.transitionRate];
+    [self applyVideoModeState:state];
 
     for (ATEMKeyState *key in state.upstreamKeys) {
         if (key.index < self.upstreamKeyButtons.count)
@@ -1867,7 +1953,7 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
 
 - (void)featurePressed:(NSButton *)sender
 {
-    NSArray<NSString *> *features = @[@"audio", @"color", @"hyperdeck"];
+    NSArray<NSString *> *features = @[@"audio", @"color", @"hyperdeck", @"labels"];
     if (sender.tag < 0 || (NSUInteger)sender.tag >= features.count)
         return;
     void (^handler)(NSString *, NSUInteger) = self.featureActionHandler;
@@ -1897,12 +1983,171 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
     [self.activeController setNextTransitionSelection:selection];
 }
 
+/// YES while the user is typing into the RATE field. AppKit hands editing to a
+/// shared field editor, so the text field itself is never the first responder.
+- (BOOL)isEditingRateField
+{
+    NSResponder *responder = self.rateField.window.firstResponder;
+    if (![responder isKindOfClass:[NSTextView class]])
+        return NO;
+    return (id)((NSTextView *)responder).delegate == (id)self.rateField;
+}
+
+/// Pushes the switcher's rate into the RATE controls, but never on top of an
+/// edit in progress and never inside the echo window after a local change.
+- (void)applyTransitionRate:(uint32_t)rate
+{
+    if ([self isEditingRateField])
+        return;
+    if ([NSDate timeIntervalSinceReferenceDate] < self.rateEchoSuppressUntil)
+        return;
+    if (self.rateField.integerValue != (NSInteger)rate)
+        self.rateField.integerValue = (NSInteger)rate;
+    if (self.rateStepper.integerValue != (NSInteger)rate)
+        self.rateStepper.integerValue = (NSInteger)rate;
+}
+
+#pragma mark - Video standard
+
+- (ATEMVideoModeOption *)videoModeOptionForRawMode:(uint32_t)rawMode
+{
+    for (ATEMVideoModeOption *option in self.videoModeOptions) {
+        if (option.rawMode == rawMode)
+            return option;
+    }
+    return nil;
+}
+
+/// Distinct format names, in the order the controller supplied them.
+- (NSArray<NSString *> *)videoFormatNames
+{
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    for (ATEMVideoModeOption *option in self.videoModeOptions) {
+        if (![names containsObject:option.formatName])
+            [names addObject:option.formatName];
+    }
+    return names;
+}
+
+- (void)rebuildVideoFormatPopup
+{
+    [self.videoFormatPopup removeAllItems];
+    for (NSString *name in [self videoFormatNames])
+        [self.videoFormatPopup addItemWithTitle:name];
+    [self rebuildVideoRatePopupForFormat:self.videoFormatPopup.titleOfSelectedItem selecting:nil];
+}
+
+- (void)rebuildVideoRatePopupForFormat:(NSString *)format selecting:(NSString *)frameRate
+{
+    [self.videoRatePopup removeAllItems];
+    for (ATEMVideoModeOption *option in self.videoModeOptions) {
+        if (![option.formatName isEqualToString:format])
+            continue;
+        NSString *title = option.frameRateName.length ? option.frameRateName : @"—";
+        if (![self.videoRatePopup itemWithTitle:title])
+            [self.videoRatePopup addItemWithTitle:title];
+    }
+    if (frameRate.length && [self.videoRatePopup itemWithTitle:frameRate])
+        [self.videoRatePopup selectItemWithTitle:frameRate];
+}
+
+- (ATEMVideoModeOption *)selectedVideoModeOption
+{
+    NSString *format = self.videoFormatPopup.titleOfSelectedItem;
+    NSString *rate = self.videoRatePopup.titleOfSelectedItem;
+    if (!format)
+        return nil;
+    for (ATEMVideoModeOption *option in self.videoModeOptions) {
+        if (![option.formatName isEqualToString:format])
+            continue;
+        NSString *title = option.frameRateName.length ? option.frameRateName : @"—";
+        if (!rate || [title isEqualToString:rate])
+            return option;
+    }
+    return nil;
+}
+
+- (void)applyVideoModeState:(ATEMState *)state
+{
+    NSMutableString *signature = [NSMutableString string];
+    for (ATEMVideoModeOption *option in state.supportedVideoModes)
+        [signature appendFormat:@"%u|", option.rawMode];
+    if (![signature isEqualToString:self.videoModeSignature]) {
+        self.videoModeSignature = [signature copy];
+        self.videoModeOptions = state.supportedVideoModes;
+        [self rebuildVideoFormatPopup];
+        self.syncedVideoMode = UINT32_MAX;
+    }
+
+    BOOL usable = state.isConnected && state.canChangeVideoMode;
+    self.videoFormatPopup.enabled = usable;
+    self.videoRatePopup.enabled = usable;
+    self.videoApplyButton.enabled = usable;
+
+    ATEMVideoModeOption *current = [self videoModeOptionForRawMode:state.videoMode];
+    if (!state.isConnected)
+        self.videoModeLabel.stringValue = @"Connect to read the switcher video standard.";
+    else if (current)
+        self.videoModeLabel.stringValue = [NSString stringWithFormat:@"Switcher is running %@.", current.displayName];
+    else
+        self.videoModeLabel.stringValue = [NSString stringWithFormat:@"Switcher is running an unlabelled mode (%u).", state.videoMode];
+
+    // Only follow the switcher when it actually changed, so a pending selection
+    // the user has not applied yet is not yanked out from under them.
+    if (state.videoMode != self.syncedVideoMode) {
+        self.syncedVideoMode = state.videoMode;
+        if (current) {
+            [self.videoFormatPopup selectItemWithTitle:current.formatName];
+            [self rebuildVideoRatePopupForFormat:current.formatName
+                                       selecting:current.frameRateName.length ? current.frameRateName : @"—"];
+        }
+    }
+}
+
+- (void)videoFormatChanged:(NSPopUpButton *)sender
+{
+    [self rebuildVideoRatePopupForFormat:sender.titleOfSelectedItem selecting:nil];
+}
+
+- (void)videoRateChanged:(NSPopUpButton *)sender
+{
+    (void)sender;
+}
+
+- (void)videoStandardApplyPressed:(id)sender
+{
+    (void)sender;
+    ATEMVideoModeOption *option = [self selectedVideoModeOption];
+    if (!option)
+        return;
+    if (option.rawMode == self.state.videoMode)
+        return;
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.alertStyle = NSAlertStyleCritical;
+    alert.messageText = [NSString stringWithFormat:@"Change the video standard to %@?", option.displayName];
+    alert.informativeText = @"Every switcher output re-syncs. Program, preview, multiview and any downstream "
+                             "recorder or streaming encoder will drop for several seconds, and inputs running a "
+                             "different standard will go to black until they are re-locked. Do not do this on air.";
+    [alert addButtonWithTitle:@"Change Standard"];
+    [alert addButtonWithTitle:@"Cancel"];
+    if ([alert runModal] != NSAlertFirstButtonReturn)
+        return;
+
+    [self.activeController setVideoMode:option.rawMode];
+    self.syncedVideoMode = UINT32_MAX;
+}
+
 - (void)rateChanged:(id)sender
 {
     NSInteger value = [sender integerValue];
     value = MAX(1, MIN(250, value));
-    self.rateField.integerValue = value;
-    self.rateStepper.integerValue = value;
+    // Hold off the poll long enough for the switcher to acknowledge the write.
+    self.rateEchoSuppressUntil = [NSDate timeIntervalSinceReferenceDate] + 1.0;
+    if (self.rateField.integerValue != value)
+        self.rateField.integerValue = value;
+    if (self.rateStepper.integerValue != value)
+        self.rateStepper.integerValue = value;
     [self.activeController setTransitionRate:(uint32_t)value];
 }
 

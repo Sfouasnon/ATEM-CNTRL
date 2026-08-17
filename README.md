@@ -12,10 +12,12 @@ Version 0.4 expands the compact live switcher console with dedicated Fairlight A
 - A compact Signal Slate interface with broadcast tally colors, layered controls, and distinct active-state edges
 - An original AC launcher icon and matching ATEM CNTRL header wordmark
 - Capability-driven input lists and names
+- Dedicated Input & Output Labels window for editing switcher-stored long and short names, including AUX and multiview outputs
 - Program and Preview source selection for the first M/E
 - CUT, AUTO, Fade to Black, and a continuous T-bar
 - MIX, DIP, WIPE, DVE, and STINGER next-transition selection
-- Transition rate and Background/Key transition selection
+- Transition rate and Background/Key transition selection, with the rate field and stepper protected from being overwritten by the state poll while you edit them
+- Switcher video standard selection with separate Format and Frame Rate menus, built from the switcher's own `DoesSupportVideoMode` answers and confirmed before it is applied
 - Up to four upstream key On Air controls, when available
 - Downstream key Tie, On Air, and Auto controls
 - AUX output routing
@@ -34,7 +36,7 @@ Version 0.4 expands the compact live switcher console with dedicated Fairlight A
 - Dedicated Camera/Color window with Lift, Gamma, Gain, Offset, Contrast, Luma Mix, Hue, Saturation, per-stage reset, and full color reset
 - Explicit, restartable camera-control engine that runs outside the main app and is terminated if startup stalls, the ATEM disconnects, or its target address changes
 - Independent A/B target selectors in every feature window
-- Window-menu shortcuts: Switcher Console `⌘1`, Audio `⌘2`, Camera/Color `⌘3`, and HyperDeck `⌘4`
+- Window-menu shortcuts: Switcher Console `⌘1`, Audio `⌘2`, Camera/Color `⌘3`, HyperDeck `⌘4`, and Input & Output Labels `⌘5`
 - Live state polling plus Blackmagic SDK event callbacks
 - A no-hardware Demo mode
 - Offline rendering, diagnostics, runtime checks, and ad-hoc code signing
@@ -65,7 +67,7 @@ These ATEM Software Control areas are not implemented yet:
 
 - Media-pool transfer and media-player pages
 - Streaming and ISO recording pages
-- Macros, SuperSource, and general switcher setup
+- Macros, SuperSource, and the remaining general switcher setup controls (multiview standard, down-conversion, 3G-SDI output level, label sets)
 - Full Fairlight EQ/dynamics/effects editors and legacy non-Fairlight mixer fallback
 - HyperDeck storage-media management, callbacks, and detailed transient-error reporting
 - Camera lens, exposure, detail, and tally controls outside the color-correction category
@@ -104,6 +106,7 @@ make preview    # render the UI to build/preview.png
 make preview-multiview # render the multiview editor to build/multiview-preview.png
 make preview-audio # render the dedicated audio window
 make preview-color # render the dedicated color window
+make preview-labels # render the Input & Output Labels window
 make preview-hyperdeck # render the dedicated HyperDeck window
 make test       # validate runtime loading and enum mappings
 make diagnose   # print OS, architecture, and runtime details
@@ -119,14 +122,15 @@ Use a switcher that is not carrying an irreplaceable live output for the first t
 2. Open `build/ATEM CNTRL.app` on the Tahoe Mac.
 3. Enter the ATEM IP address and click **Connect**.
 4. Confirm the product name, input names, current Program/Preview selections, key states, and multiview state appear without touching a control.
-5. Open Audio, confirm channel names and idle levels, then move one non-critical source fader and return it to its original value.
-6. Open HyperDeck, verify each slot’s existing address before changing anything, then test transport only on non-critical media. The ATEM owns the TCP 9993 connection; the Mac does not connect directly to the deck.
-7. Open Camera/Color and start the isolated engine. Read values first; test one small change on a non-critical camera, reset it, then stop and restart the helper once.
-8. On a non-critical multiview window, test source routing and one overlay toggle, then confirm the ATEM output follows it.
-9. Select a known-safe Preview input and test CUT/AUTO only after confirming the output is safe to change.
-10. Select session B, connect the second ATEM, and confirm session A remains connected before issuing a safe command on each unit and in each feature window.
-11. Leave both connected for at least ten minutes and exercise reconnect once on each session.
-12. If the main app hangs, capture a fresh sample with `sample ATEMCNTRL 10 -file ATEMCNTRL.sample.txt` before force-quitting. If only Color stalls, stop the isolated engine and retain its status message.
+5. Open Input & Output Labels, rename one non-critical input and AUX output, confirm the new labels appear in the console, then restore both names.
+6. Open Audio, confirm channel names and idle levels, then move one non-critical source fader and return it to its original value.
+7. Open HyperDeck, verify each slot’s existing address before changing anything, then test transport only on non-critical media. The ATEM owns the TCP 9993 connection; the Mac does not connect directly to the deck.
+8. Open Camera/Color and start the isolated engine. Read values first; test one small change on a non-critical camera, reset it, then stop and restart the helper once.
+9. On a non-critical multiview window, test source routing and one overlay toggle, then confirm the ATEM output follows it.
+10. Select a known-safe Preview input and test CUT/AUTO only after confirming the output is safe to change.
+11. Select session B, connect the second ATEM, and confirm session A remains connected before issuing a safe command on each unit and in each feature window.
+12. Leave both connected for at least ten minutes and exercise reconnect once on each session.
+13. If the main app hangs, capture a fresh sample with `sample ATEMCNTRL 10 -file ATEMCNTRL.sample.txt` before force-quitting. If only Color stalls, stop the isolated engine and retain its status message.
 
 No ATEM advertised `_blackmagic._tcp` on the development machine's current network, so live hardware behavior could not be verified here.
 

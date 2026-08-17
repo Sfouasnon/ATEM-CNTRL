@@ -43,6 +43,39 @@ NSNotificationName const ATEMStateDidChangeNotification = @"ATEMStateDidChangeNo
 @end
 
 
+@interface ATEMLabelTargetState ()
+@property(nonatomic, readwrite) int64_t inputID;
+@property(nonatomic, copy, readwrite) NSString *longName;
+@property(nonatomic, copy, readwrite) NSString *shortName;
+@property(nonatomic, copy, readwrite) NSString *typeName;
+@property(nonatomic, readwrite, getter=isOutput) BOOL output;
++ (instancetype)targetWithInputID:(int64_t)inputID
+                         longName:(NSString *)longName
+                        shortName:(NSString *)shortName
+                         typeName:(NSString *)typeName
+                           output:(BOOL)output;
+@end
+
+@implementation ATEMLabelTargetState
+
++ (instancetype)targetWithInputID:(int64_t)inputID
+                         longName:(NSString *)longName
+                        shortName:(NSString *)shortName
+                         typeName:(NSString *)typeName
+                           output:(BOOL)output
+{
+    ATEMLabelTargetState *target = [[ATEMLabelTargetState alloc] init];
+    target.inputID = inputID;
+    target.longName = longName ?: @"";
+    target.shortName = shortName ?: @"";
+    target.typeName = typeName ?: @"Input";
+    target.output = output;
+    return target;
+}
+
+@end
+
+
 @interface ATEMKeyState ()
 @property(nonatomic, readwrite) NSUInteger index;
 @property(nonatomic, readwrite, getter=isOnAir) BOOL onAir;
@@ -244,6 +277,10 @@ NSNotificationName const ATEMStateDidChangeNotification = @"ATEMStateDidChangeNo
 @property(nonatomic, copy, readwrite) NSArray<ATEMDownstreamKeyState *> *downstreamKeys;
 @property(nonatomic, copy, readwrite) NSArray<ATEMAuxState *> *auxOutputs;
 @property(nonatomic, copy, readwrite) NSArray<ATEMMultiviewState *> *multiviews;
+@property(nonatomic, copy, readwrite) NSArray<ATEMLabelTargetState *> *labelTargets;
+@property(nonatomic, readwrite) uint32_t videoMode;
+@property(nonatomic, readwrite) BOOL canChangeVideoMode;
+@property(nonatomic, copy, readwrite) NSArray<ATEMVideoModeOption *> *supportedVideoModes;
 @end
 
 @implementation ATEMState
@@ -363,9 +400,17 @@ private:
 
 struct AuxAPIRecord
 {
+    int64_t inputID = 0;
     IBMDSwitcherInputAux *api = nullptr;
     __strong NSString *name = nil;
     uint32_t inputAvailabilityMask = 0;
+};
+
+struct InputAPIRecord
+{
+    int64_t inputID = 0;
+    BMDSwitcherPortType portType = bmdSwitcherPortTypeExternal;
+    IBMDSwitcherInput *api = nullptr;
 };
 
 struct FairlightSourceAPIRecord
@@ -510,6 +555,7 @@ static void EnsurePendingMultiviewWindowCount(PendingMultiview &pending, NSUInte
     MixEffectBlockMonitor *_mixEffectBlockMonitor;
     std::vector<IBMDSwitcherKey *> _upstreamKeyAPIs;
     std::vector<IBMDSwitcherDownstreamKey *> _downstreamKeyAPIs;
+    std::vector<InputAPIRecord> _inputAPIs;
     std::vector<AuxAPIRecord> _auxAPIs;
     std::vector<IBMDSwitcherMultiView *> _multiviewAPIs;
     std::vector<PendingMultiview> _pendingMultiviews;
@@ -530,10 +576,13 @@ static void EnsurePendingMultiviewWindowCount(PendingMultiview &pending, NSUInte
     NSString *_productName;
     NSString *_statusMessage;
     NSArray<ATEMInputState *> *_inputStates;
+    NSArray<ATEMLabelTargetState *> *_labelStates;
     NSDictionary<NSNumber *, NSString *> *_inputNamesByID;
     uint32_t _mixEffectInputAvailabilityMask;
+    NSArray<ATEMVideoModeOption *> *_supportedVideoModes;
 
     int64_t _demoProgram;
+    uint32_t _demoVideoMode;
     int64_t _demoPreview;
     double _demoTransitionPosition;
     BOOL _demoInTransition;
@@ -733,6 +782,56 @@ static NSString *InputNameForID(NSArray<ATEMInputState *> *inputs, int64_t input
     return [NSString stringWithFormat:@"Input %lld", inputID];
 }
 
+static BOOL IsOutputPortType(BMDSwitcherPortType portType)
+{
+    return portType == bmdSwitcherPortTypeMixEffectBlockOutput ||
+           portType == bmdSwitcherPortTypeAuxOutput ||
+           portType == bmdSwitcherPortTypeKeyCutOutput ||
+           portType == bmdSwitcherPortTypeMultiview ||
+           portType == bmdSwitcherPortTypeAudioMonitor;
+}
+
+static NSString *PortTypeName(BMDSwitcherPortType portType)
+{
+    switch (portType) {
+        case bmdSwitcherPortTypeExternal: return @"Camera / Input";
+        case bmdSwitcherPortTypeExternalDirect: return @"Direct Input";
+        case bmdSwitcherPortTypeBlack: return @"Black Generator";
+        case bmdSwitcherPortTypeColorBars: return @"Color Bars";
+        case bmdSwitcherPortTypeColorGenerator: return @"Color Generator";
+        case bmdSwitcherPortTypeMediaPlayerFill: return @"Media Player Fill";
+        case bmdSwitcherPortTypeMediaPlayerCut: return @"Media Player Key";
+        case bmdSwitcherPortTypeSuperSource: return @"SuperSource";
+        case bmdSwitcherPortTypeMixEffectBlockOutput: return @"M/E Output";
+        case bmdSwitcherPortTypeAuxOutput: return @"Aux Output";
+        case bmdSwitcherPortTypeKeyCutOutput: return @"Key Output";
+        case bmdSwitcherPortTypeMultiview: return @"Multiview Output";
+        case bmdSwitcherPortTypeAudioMonitor: return @"Audio Monitor Output";
+        default: return @"Input";
+    }
+}
+
+static NSString *LabelLongNameForID(NSArray<ATEMLabelTargetState *> *targets,
+                                    int64_t inputID,
+                                    NSString *fallback)
+{
+    for (ATEMLabelTargetState *target in targets)
+        if (target.inputID == inputID)
+            return target.longName.length ? target.longName : fallback;
+    return fallback;
+}
+
+static ATEMLabelTargetState *LabelTargetForID(NSArray<ATEMLabelTargetState *> *targets, int64_t inputID)
+{
+    for (ATEMLabelTargetState *target in targets)
+        if (target.inputID == inputID)
+            return target;
+    return nil;
+}
+
+static const int64_t kDemoAuxLabelBase = 10000;
+static const int64_t kDemoMultiviewLabelBase = 11000;
+
 static ATEMHyperDeckConnectionStatus AppHyperDeckConnectionStatus(BMDSwitcherHyperDeckConnectionStatus status)
 {
     switch (status) {
@@ -795,6 +894,101 @@ static NSString *UnpackHyperDeckAddress(uint32_t packedAddress)
             (packedAddress >> 8U) & 0xFFU,
             (packedAddress >> 16U) & 0xFFU,
             (packedAddress >> 24U) & 0xFFU];
+}
+
+#pragma mark - Video standard table
+
+typedef struct {
+    BMDSwitcherVideoMode mode;
+    const char *format;
+    const char *frameRate;
+} ATEMVideoModeEntry;
+
+// Labels for the BMDSwitcherVideoMode values this app knows how to name, in the
+// order they should appear in the UI. The switcher is asked which of these it
+// actually supports, so listing a mode a given ATEM cannot run is harmless.
+//
+// MAINTENANCE: every symbol below must exist in the installed BMDSwitcherAPI.h.
+// If a build fails with "use of undeclared identifier bmdSwitcherVideoMode...",
+// delete that one line and rebuild — the numeric fallback probe below will still
+// surface the mode, just with a generic label.
+static const ATEMVideoModeEntry kATEMVideoModeTable[] = {
+    { bmdSwitcherVideoMode525i5994NTSC,     "NTSC 4:3",   "59.94" },
+    { bmdSwitcherVideoMode525i5994Anamorphic, "NTSC 16:9",  "59.94" },
+    { bmdSwitcherVideoMode625i50PAL,        "PAL 4:3",    "50"    },
+    { bmdSwitcherVideoMode625i50Anamorphic, "PAL 16:9",   "50"    },
+    { bmdSwitcherVideoMode720p50,           "720p",       "50"    },
+    { bmdSwitcherVideoMode720p5994,         "720p",       "59.94" },
+    { bmdSwitcherVideoMode1080i50,          "1080i",      "50"    },
+    { bmdSwitcherVideoMode1080i5994,        "1080i",      "59.94" },
+    { bmdSwitcherVideoMode1080p2398,        "1080p",      "23.98" },
+    { bmdSwitcherVideoMode1080p24,          "1080p",      "24"    },
+    { bmdSwitcherVideoMode1080p25,          "1080p",      "25"    },
+    { bmdSwitcherVideoMode1080p2997,        "1080p",      "29.97" },
+    { bmdSwitcherVideoMode1080p50,          "1080p",      "50"    },
+    { bmdSwitcherVideoMode1080p5994,        "1080p",      "59.94" },
+    { bmdSwitcherVideoMode4KHDp2398,        "2160p",      "23.98" },
+    { bmdSwitcherVideoMode4KHDp24,          "2160p",      "24"    },
+    { bmdSwitcherVideoMode4KHDp25,          "2160p",      "25"    },
+    { bmdSwitcherVideoMode4KHDp2997,        "2160p",      "29.97" },
+    { bmdSwitcherVideoMode4KHDp50,          "2160p",      "50"    },
+    { bmdSwitcherVideoMode4KHDp5994,        "2160p",      "59.94" },
+    { bmdSwitcherVideoMode8KHDp2398,        "4320p",      "23.98" },
+    { bmdSwitcherVideoMode8KHDp24,          "4320p",      "24"    },
+    { bmdSwitcherVideoMode8KHDp25,          "4320p",      "25"    },
+    { bmdSwitcherVideoMode8KHDp2997,        "4320p",      "29.97" },
+    { bmdSwitcherVideoMode8KHDp50,          "4320p",      "50"    },
+    { bmdSwitcherVideoMode8KHDp5994,        "4320p",      "59.94" },
+};
+
+static const size_t kATEMVideoModeTableCount = sizeof(kATEMVideoModeTable) / sizeof(kATEMVideoModeTable[0]);
+
+// Upper bound for the fallback probe. BMDSwitcherVideoMode is a dense low-valued
+// enum; 128 covers every published value with headroom for future additions.
+static const uint32_t kATEMVideoModeProbeLimit = 128;
+
+@interface ATEMVideoModeOption ()
+@property(nonatomic, readwrite) uint32_t rawMode;
+@property(nonatomic, copy, readwrite) NSString *formatName;
+@property(nonatomic, copy, readwrite) NSString *frameRateName;
++ (instancetype)optionWithRawMode:(uint32_t)rawMode
+                           format:(NSString *)format
+                        frameRate:(NSString *)frameRate;
+@end
+
+@implementation ATEMVideoModeOption
+
++ (instancetype)optionWithRawMode:(uint32_t)rawMode
+                           format:(NSString *)format
+                        frameRate:(NSString *)frameRate
+{
+    ATEMVideoModeOption *option = [[ATEMVideoModeOption alloc] init];
+    option.rawMode = rawMode;
+    option.formatName = format ?: @"";
+    option.frameRateName = frameRate ?: @"";
+    return option;
+}
+
+- (NSString *)displayName
+{
+    if (self.frameRateName.length == 0)
+        return self.formatName;
+    return [NSString stringWithFormat:@"%@%@", self.formatName, self.frameRateName];
+}
+
+@end
+
+/// Every mode in the label table, used for demo mode where no switcher can be asked.
+static NSArray<ATEMVideoModeOption *> *ATEMAllKnownVideoModes(void)
+{
+    NSMutableArray<ATEMVideoModeOption *> *options = [NSMutableArray array];
+    for (size_t index = 0; index < kATEMVideoModeTableCount; ++index) {
+        const ATEMVideoModeEntry &entry = kATEMVideoModeTable[index];
+        [options addObject:[ATEMVideoModeOption optionWithRawMode:(uint32_t)entry.mode
+                                                           format:@(entry.format)
+                                                        frameRate:@(entry.frameRate)]];
+    }
+    return [options copy];
 }
 
 static ATEMTransitionStyle AppTransitionStyle(BMDSwitcherTransitionStyle style)
@@ -934,7 +1128,10 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
         ? @"Enter the switcher IP address to connect."
         : @"Blackmagic Switchers runtime not found. Install ATEM Software Control first.";
     _inputStates = @[];
+    _labelStates = @[];
     _inputNamesByID = @{};
+    _supportedVideoModes = @[];
+    _demoVideoMode = (uint32_t)bmdSwitcherVideoMode1080p5994;
     _hyperDeckClipCache = [NSMutableDictionary dictionary];
     _hyperDeckClipCacheTimes = [NSMutableDictionary dictionary];
     _hyperDeckClipCacheCounts = [NSMutableDictionary dictionary];
@@ -1005,6 +1202,10 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     state.downstreamKeys = @[];
     state.auxOutputs = @[];
     state.multiviews = @[];
+    state.labelTargets = @[];
+    state.videoMode = 0;
+    state.canChangeVideoMode = NO;
+    state.supportedVideoModes = @[];
     return state;
 }
 
@@ -1071,6 +1272,44 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     });
 }
 
+/// Asks the connected switcher which video standards it accepts. Runs once per
+/// connection: the answer is a hardware capability and does not change at runtime.
+- (void)refreshSupportedVideoModesLocked
+{
+    if (!_switcher) {
+        _supportedVideoModes = @[];
+        return;
+    }
+
+    NSMutableArray<ATEMVideoModeOption *> *options = [NSMutableArray array];
+    NSMutableSet<NSNumber *> *listed = [NSMutableSet set];
+
+    for (size_t index = 0; index < kATEMVideoModeTableCount; ++index) {
+        const ATEMVideoModeEntry &entry = kATEMVideoModeTable[index];
+        bool supported = false;
+        if (FAILED(_switcher->DoesSupportVideoMode(entry.mode, &supported)) || !supported)
+            continue;
+        [options addObject:[ATEMVideoModeOption optionWithRawMode:(uint32_t)entry.mode
+                                                           format:@(entry.format)
+                                                        frameRate:@(entry.frameRate)]];
+        [listed addObject:@((uint32_t)entry.mode)];
+    }
+
+    // Any mode this build has no label for is still reachable rather than hidden.
+    for (uint32_t raw = 0; raw < kATEMVideoModeProbeLimit; ++raw) {
+        if ([listed containsObject:@(raw)])
+            continue;
+        bool supported = false;
+        if (FAILED(_switcher->DoesSupportVideoMode((BMDSwitcherVideoMode)raw, &supported)) || !supported)
+            continue;
+        [options addObject:[ATEMVideoModeOption optionWithRawMode:raw
+                                                           format:[NSString stringWithFormat:@"Mode %u", raw]
+                                                        frameRate:@""]];
+    }
+
+    _supportedVideoModes = [options copy];
+}
+
 - (BOOL)configureConnectedSwitcherLocked
 {
     CFStringRef productName = nullptr;
@@ -1078,6 +1317,8 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
         _productName = StringFromOwnedCFString(productName);
     else
         _productName = @"ATEM Switcher";
+
+    [self refreshSupportedVideoModesLocked];
 
     IBMDSwitcherMixEffectBlockIterator *meIterator = nullptr;
     if (FAILED(_switcher->CreateIterator(IID_IBMDSwitcherMixEffectBlockIterator, (void **)&meIterator)) || !meIterator)
@@ -1099,6 +1340,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     _mixEffectBlock->GetInputAvailabilityMask(&meAvailability);
     _mixEffectInputAvailabilityMask = (uint32_t)meAvailability;
     NSMutableArray<ATEMInputState *> *inputs = [NSMutableArray array];
+    NSMutableArray<ATEMLabelTargetState *> *labelTargets = [NSMutableArray array];
     NSMutableDictionary<NSNumber *, NSString *> *inputNames = [NSMutableDictionary dictionary];
     IBMDSwitcherInputIterator *inputIterator = nullptr;
     if (SUCCEEDED(_switcher->CreateIterator(IID_IBMDSwitcherInputIterator, (void **)&inputIterator)) && inputIterator) {
@@ -1119,7 +1361,19 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
             NSString *displayName = longValue.length
                 ? longValue
                 : (shortValue.length ? shortValue : [NSString stringWithFormat:@"Input %lld", inputID]);
+            NSString *shortDisplayName = shortValue.length ? shortValue : displayName;
             inputNames[@(inputID)] = displayName;
+            [labelTargets addObject:[ATEMLabelTargetState targetWithInputID:inputID
+                                                                   longName:displayName
+                                                                  shortName:shortDisplayName
+                                                                   typeName:PortTypeName(portType)
+                                                                     output:IsOutputPortType(portType)]];
+
+            InputAPIRecord inputRecord;
+            inputRecord.inputID = inputID;
+            inputRecord.portType = portType;
+            inputRecord.api = input;
+            _inputAPIs.push_back(inputRecord);
 
             if (portType != bmdSwitcherPortTypeAuxOutput &&
                 portType != bmdSwitcherPortTypeMultiview &&
@@ -1134,6 +1388,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
                 IBMDSwitcherInputAux *aux = nullptr;
                 if (SUCCEEDED(input->QueryInterface(IID_IBMDSwitcherInputAux, (void **)&aux)) && aux) {
                     AuxAPIRecord record;
+                    record.inputID = inputID;
                     record.api = aux;
                     record.name = longValue.length ? longValue : [NSString stringWithFormat:@"Aux %lu", (unsigned long)_auxAPIs.size() + 1];
                     BMDSwitcherInputAvailability auxAvailability = (BMDSwitcherInputAvailability)0;
@@ -1142,12 +1397,12 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
                     _auxAPIs.push_back(record);
                 }
             }
-            input->Release();
             input = nullptr;
         }
         inputIterator->Release();
     }
     _inputStates = [inputs copy];
+    _labelStates = [labelTargets copy];
     _inputNamesByID = [inputNames copy];
 
     IBMDSwitcherKeyIterator *keyIterator = nullptr;
@@ -1302,6 +1557,13 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     }
     _auxAPIs.clear();
 
+    for (InputAPIRecord &record : _inputAPIs) {
+        if (record.api)
+            record.api->Release();
+        record.api = nullptr;
+    }
+    _inputAPIs.clear();
+
     for (IBMDSwitcherKey *key : _upstreamKeyAPIs)
         key->Release();
     _upstreamKeyAPIs.clear();
@@ -1328,8 +1590,10 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
 
     _productName = @"";
     _inputStates = @[];
+    _labelStates = @[];
     _inputNamesByID = @{};
     _mixEffectInputAvailabilityMask = 0;
+    _supportedVideoModes = @[];
     if (message.length)
         _statusMessage = message;
     [self publishFeatureStatesLocked];
@@ -1425,6 +1689,31 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
         for (ATEMInputState *input in self->_inputStates)
             inputNames[@(input.inputID)] = input.longName;
         self->_inputNamesByID = [inputNames copy];
+        NSMutableArray<ATEMLabelTargetState *> *labelTargets = [NSMutableArray array];
+        for (ATEMInputState *input in self->_inputStates) {
+            [labelTargets addObject:[ATEMLabelTargetState targetWithInputID:input.inputID
+                                                                   longName:input.longName
+                                                                  shortName:input.shortName
+                                                                   typeName:@"Camera / Input"
+                                                                     output:NO]];
+        }
+        for (NSUInteger index = 0; index < 2; ++index) {
+            NSString *name = [NSString stringWithFormat:@"Aux %lu", (unsigned long)index + 1];
+            [labelTargets addObject:[ATEMLabelTargetState targetWithInputID:kDemoAuxLabelBase + (int64_t)index
+                                                                   longName:name
+                                                                  shortName:[NSString stringWithFormat:@"A%lu", (unsigned long)index + 1]
+                                                                   typeName:@"Aux Output"
+                                                                     output:YES]];
+        }
+        for (NSUInteger index = 0; index < 2; ++index) {
+            NSString *name = [NSString stringWithFormat:@"Multiview %lu", (unsigned long)index + 1];
+            [labelTargets addObject:[ATEMLabelTargetState targetWithInputID:kDemoMultiviewLabelBase + (int64_t)index
+                                                                   longName:name
+                                                                  shortName:[NSString stringWithFormat:@"MV%lu", (unsigned long)index + 1]
+                                                                   typeName:@"Multiview Output"
+                                                                     output:YES]];
+        }
+        self->_labelStates = [labelTargets copy];
         self->_mixEffectInputAvailabilityMask = 0xFFFFFFFFU;
         self->_demoProgram = 1;
         self->_demoPreview = 2;
@@ -1433,6 +1722,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
         self->_demoStyle = ATEMTransitionStyleMix;
         self->_demoSelection = ATEMTransitionSelectionBackground;
         self->_demoRate = 25;
+        self->_demoVideoMode = (uint32_t)bmdSwitcherVideoMode1080p5994;
         self->_demoFTB = NO;
         self->_demoKeys = std::vector<bool>(4, false);
         self->_demoDSKOnAir = std::vector<bool>(2, false);
@@ -1494,6 +1784,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     state.productName = _productName ?: @"";
     state.statusMessage = _statusMessage ?: @"";
     state.inputs = _inputStates ?: @[];
+    state.labelTargets = _labelStates ?: @[];
     state.mixEffectInputAvailabilityMask = _mixEffectInputAvailabilityMask;
     state.programInputID = -1;
     state.previewInputID = -1;
@@ -1506,6 +1797,9 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     state.fadeToBlack = NO;
     state.fadeToBlackTransitioning = NO;
     state.fadeToBlackFramesRemaining = 0;
+    state.videoMode = 0;
+    state.supportedVideoModes = @[];
+    state.canChangeVideoMode = NO;
 
     NSMutableArray<ATEMKeyState *> *keys = [NSMutableArray array];
     NSMutableArray<ATEMDownstreamKeyState *> *dsks = [NSMutableArray array];
@@ -1521,6 +1815,9 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
         state.nextTransitionSelection = _demoSelection;
         state.transitionRate = _demoRate;
         state.fadeToBlack = _demoFTB;
+        state.videoMode = _demoVideoMode;
+        state.supportedVideoModes = ATEMAllKnownVideoModes();
+        state.canChangeVideoMode = YES;
         for (NSUInteger index = 0; index < _demoKeys.size(); ++index)
             [keys addObject:[[ATEMKeyState alloc] initWithIndex:index onAir:_demoKeys[index]]];
         for (NSUInteger index = 0; index < _demoDSKOnAir.size(); ++index) {
@@ -1532,7 +1829,9 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
         }
         for (NSUInteger index = 0; index < _demoAuxSources.size(); ++index) {
             [auxes addObject:[[ATEMAuxState alloc] initWithIndex:index
-                                                           name:[NSString stringWithFormat:@"Aux %lu", (unsigned long)index + 1]
+                                                           name:LabelLongNameForID(_labelStates,
+                                                                                 kDemoAuxLabelBase + (int64_t)index,
+                                                                                 [NSString stringWithFormat:@"Aux %lu", (unsigned long)index + 1])
                                                        sourceID:_demoAuxSources[index]
                                           inputAvailabilityMask:0xFFFFFFFFU]];
         }
@@ -1630,6 +1929,12 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
                 break;
         }
         state.transitionRate = rate;
+
+        BMDSwitcherVideoMode currentVideoMode = (BMDSwitcherVideoMode)0;
+        if (_switcher && SUCCEEDED(_switcher->GetVideoMode(&currentVideoMode)))
+            state.videoMode = (uint32_t)currentVideoMode;
+        state.supportedVideoModes = _supportedVideoModes ?: @[];
+        state.canChangeVideoMode = state.supportedVideoModes.count > 1;
 
         for (NSUInteger index = 0; index < _upstreamKeyAPIs.size(); ++index) {
             bool onAir = false;
@@ -2247,6 +2552,22 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     });
 }
 
+- (void)setVideoMode:(uint32_t)videoMode
+{
+    dispatch_async(_controlQueue, ^{
+        if (self->_demo) {
+            self->_demoVideoMode = videoMode;
+        } else if (self->_switcher) {
+            bool supported = false;
+            if (SUCCEEDED(self->_switcher->DoesSupportVideoMode((BMDSwitcherVideoMode)videoMode, &supported)) && supported)
+                self->_switcher->SetVideoMode((BMDSwitcherVideoMode)videoMode);
+            else
+                self->_statusMessage = @"That video standard is not supported by this switcher.";
+        }
+        [self publishStateLocked];
+    });
+}
+
 - (void)setUpstreamKey:(NSUInteger)index onAir:(BOOL)onAir
 {
     dispatch_async(_controlQueue, ^{
@@ -2289,6 +2610,102 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
         if (self->_demo && index < self->_demoAuxSources.size()) self->_demoAuxSources[index] = sourceID;
         else if (index < self->_auxAPIs.size()) self->_auxAPIs[index].api->SetInputSource(sourceID);
         [self publishStateLocked];
+    });
+}
+
+- (void)setLabelForInput:(int64_t)inputID longName:(NSString *)longName shortName:(NSString *)shortName
+{
+    NSString *requestedLongName = [longName stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *requestedShortName = [shortName stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    dispatch_async(_controlQueue, ^{
+        if (requestedLongName.length == 0 || requestedShortName.length == 0) {
+            self->_statusMessage = @"Long and short labels cannot be empty.";
+            [self publishStateLocked];
+            return;
+        }
+
+        NSString *appliedLongName = requestedLongName;
+        NSString *appliedShortName = requestedShortName;
+        BOOL found = NO;
+        BOOL succeeded = self->_demo;
+
+        if (!self->_demo) {
+            for (InputAPIRecord &record : self->_inputAPIs) {
+                if (record.inputID != inputID || !record.api)
+                    continue;
+                found = YES;
+                HRESULT longResult = record.api->SetLongName((__bridge CFStringRef)requestedLongName);
+                HRESULT shortResult = record.api->SetShortName((__bridge CFStringRef)requestedShortName);
+                succeeded = longResult == S_OK && shortResult == S_OK;
+
+                CFStringRef currentLongName = nullptr;
+                CFStringRef currentShortName = nullptr;
+                if (SUCCEEDED(record.api->GetLongName(&currentLongName))) {
+                    NSString *value = StringFromOwnedCFString(currentLongName);
+                    if (value.length)
+                        appliedLongName = value;
+                }
+                if (SUCCEEDED(record.api->GetShortName(&currentShortName))) {
+                    NSString *value = StringFromOwnedCFString(currentShortName);
+                    if (value.length)
+                        appliedShortName = value;
+                }
+                break;
+            }
+        } else {
+            for (ATEMLabelTargetState *target in self->_labelStates) {
+                if (target.inputID == inputID) {
+                    found = YES;
+                    break;
+                }
+            }
+        }
+
+        if (!found) {
+            self->_statusMessage = @"That switcher label endpoint is no longer available.";
+            [self publishStateLocked];
+            return;
+        }
+
+        NSMutableArray<ATEMLabelTargetState *> *labelTargets = [NSMutableArray arrayWithCapacity:self->_labelStates.count];
+        for (ATEMLabelTargetState *target in self->_labelStates) {
+            if (target.inputID == inputID) {
+                [labelTargets addObject:[ATEMLabelTargetState targetWithInputID:target.inputID
+                                                                       longName:appliedLongName
+                                                                      shortName:appliedShortName
+                                                                       typeName:target.typeName
+                                                                         output:target.isOutput]];
+            } else {
+                [labelTargets addObject:target];
+            }
+        }
+        self->_labelStates = [labelTargets copy];
+
+        NSMutableArray<ATEMInputState *> *inputs = [NSMutableArray arrayWithCapacity:self->_inputStates.count];
+        for (ATEMInputState *input in self->_inputStates) {
+            if (input.inputID == inputID) {
+                [inputs addObject:[[ATEMInputState alloc] initWithID:input.inputID
+                                                           longName:appliedLongName
+                                                          shortName:appliedShortName
+                                                   availabilityMask:input.availabilityMask]];
+            } else {
+                [inputs addObject:input];
+            }
+        }
+        self->_inputStates = [inputs copy];
+
+        NSMutableDictionary<NSNumber *, NSString *> *inputNames = [self->_inputNamesByID mutableCopy] ?: [NSMutableDictionary dictionary];
+        inputNames[@(inputID)] = appliedLongName;
+        self->_inputNamesByID = [inputNames copy];
+        for (AuxAPIRecord &record : self->_auxAPIs)
+            if (record.inputID == inputID)
+                record.name = appliedLongName;
+
+        self->_statusMessage = succeeded
+            ? [NSString stringWithFormat:@"Updated label to %@ / %@.", appliedLongName, appliedShortName]
+            : @"The switcher rejected one or both labels; current values were reloaded.";
+        [self publishStateLocked];
+        [self publishFeatureStatesLocked];
     });
 }
 
@@ -2927,6 +3344,7 @@ int ATEMRunSelfTest(void)
             [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
         if (!observedState.isDemo || observedState.inputs.count != 13 ||
             observedState.upstreamKeys.count != 4 || observedState.downstreamKeys.count != 2 ||
+            observedState.labelTargets.count != 17 ||
             observedState.multiviews.count != 2 || observedState.multiviews.firstObject.windows.count != 10 ||
             !secondObservedState.isDemo || !controller.latestAudioState.isAvailable ||
             controller.latestAudioState.channels.count != 8 ||
@@ -2939,6 +3357,26 @@ int ATEMRunSelfTest(void)
             [controller shutdown];
             [secondController shutdown];
             return 5;
+        }
+        [controller setLabelForInput:1 longName:@"Wide Camera" shortName:@"WIDE"];
+        [controller setLabelForInput:kDemoAuxLabelBase longName:@"Stage Feed" shortName:@"STG"];
+        deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+        while ((![LabelTargetForID(observedState.labelTargets, 1).longName isEqualToString:@"Wide Camera"] ||
+                ![LabelTargetForID(observedState.labelTargets, kDemoAuxLabelBase).longName isEqualToString:@"Stage Feed"] ||
+                ![observedState.inputs.firstObject.shortName isEqualToString:@"WIDE"] ||
+                ![observedState.auxOutputs.firstObject.name isEqualToString:@"Stage Feed"]) &&
+               deadline.timeIntervalSinceNow > 0) {
+            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                     beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
+        }
+        if (![LabelTargetForID(observedState.labelTargets, 1).longName isEqualToString:@"Wide Camera"] ||
+            ![LabelTargetForID(observedState.labelTargets, 1).shortName isEqualToString:@"WIDE"] ||
+            ![LabelTargetForID(observedState.labelTargets, kDemoAuxLabelBase).longName isEqualToString:@"Stage Feed"] ||
+            ![observedState.inputs.firstObject.longName isEqualToString:@"Wide Camera"] ||
+            ![observedState.auxOutputs.firstObject.name isEqualToString:@"Stage Feed"]) {
+            [controller shutdown];
+            [secondController shutdown];
+            return 15;
         }
         [controller setPreviewInput:4];
         [controller performCut];
@@ -3124,6 +3562,7 @@ int ATEMRunSelfTest(void)
         [controller shutdown];
         [secondController shutdown];
         printf("asynchronous demo controller: ok\n");
+        printf("input and output label model: ok\n");
         printf("independent dual sessions: ok\n");
         printf("multiview configuration model (all 16 layouts): ok\n");
         printf("independent multiview outputs: ok\n");
