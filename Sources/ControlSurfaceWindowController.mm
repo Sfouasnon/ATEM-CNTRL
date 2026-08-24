@@ -26,6 +26,7 @@ static NSColor *ThemeProgram(void)      { return ColorRGB(0xF3485D); }
 static NSColor *ThemePreview(void)      { return ColorRGB(0x31CE7A); }
 static NSColor *ThemeAmber(void)        { return ColorRGB(0xF2AE32); }
 static NSColor *ThemeViolet(void)       { return ColorRGB(0xB27AF5); }
+static NSColor *ThemeLime(void)         { return ColorRGB(0x9BE564); }
 
 static NSColor *Blend(NSColor *color, CGFloat fraction, NSColor *other)
 {
@@ -827,6 +828,14 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
     labelsButton.fillsWhenActive = NO;
     labelsButton.toolTip = @"Edit switcher-stored input and output labels.";
     [header addSubview:labelsButton];
+    ATEMControlButton *mediaButton = [[ATEMControlButton alloc] initWithTitle:@"MEDIA"
+                                                                      target:self
+                                                                      action:@selector(featurePressed:)];
+    mediaButton.tag = 4;
+    mediaButton.activeColor = ThemeLime();
+    mediaButton.fillsWhenActive = NO;
+    mediaButton.toolTip = @"Set the colour generators and ride their exposure.";
+    [header addSubview:mediaButton];
 
     [NSLayoutConstraint activateConstraints:@[
         [brandLogo.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:18],
@@ -873,7 +882,7 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
         [statusPrefix.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:22],
         [statusPrefix.bottomAnchor constraintEqualToAnchor:header.bottomAnchor constant:-9],
         [self.statusLabel.leadingAnchor constraintEqualToAnchor:statusPrefix.trailingAnchor constant:10],
-        [self.statusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:labelsButton.leadingAnchor constant:-14],
+        [self.statusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:mediaButton.leadingAnchor constant:-14],
         [self.statusLabel.centerYAnchor constraintEqualToAnchor:statusPrefix.centerYAnchor],
 
         [hyperDeckButton.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-20],
@@ -892,6 +901,10 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
         [labelsButton.bottomAnchor constraintEqualToAnchor:hyperDeckButton.bottomAnchor],
         [labelsButton.widthAnchor constraintEqualToConstant:76],
         [labelsButton.heightAnchor constraintEqualToAnchor:hyperDeckButton.heightAnchor],
+        [mediaButton.trailingAnchor constraintEqualToAnchor:labelsButton.leadingAnchor constant:-7],
+        [mediaButton.bottomAnchor constraintEqualToAnchor:hyperDeckButton.bottomAnchor],
+        [mediaButton.widthAnchor constraintEqualToConstant:76],
+        [mediaButton.heightAnchor constraintEqualToAnchor:hyperDeckButton.heightAnchor],
     ]];
     return header;
 }
@@ -1953,7 +1966,7 @@ static NSUInteger MultiviewWindowFromTag(NSInteger tag)
 
 - (void)featurePressed:(NSButton *)sender
 {
-    NSArray<NSString *> *features = @[@"audio", @"color", @"hyperdeck", @"labels"];
+    NSArray<NSString *> *features = @[@"audio", @"color", @"hyperdeck", @"labels", @"media"];
     if (sender.tag < 0 || (NSUInteger)sender.tag >= features.count)
         return;
     void (^handler)(NSString *, NSUInteger) = self.featureActionHandler;

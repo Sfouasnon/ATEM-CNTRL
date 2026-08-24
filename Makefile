@@ -14,8 +14,16 @@ CAMERA_HELPER := $(HELPERS_DIR)/ATEMCameraHelper
 
 SDK_ROOT := /Applications/Blackmagic ATEM Switchers/Developer SDK/Mac OS X
 SDK_INCLUDE := $(SDK_ROOT)/include
+SDK_HEADER := $(SDK_INCLUDE)/BMDSwitcherAPI.h
 SDK_DISPATCH := $(SDK_INCLUDE)/BMDSwitcherAPIDispatch.cpp
 API_BUNDLE := /Library/Application Support/Blackmagic Design/Switchers/BMDSwitcherAPI.bundle
+
+# The video-standard table is generated from the installed SDK header so the app
+# offers exactly the frame rates that SDK defines, including any Blackmagic adds
+# later. See Tools/generate_video_modes.py.
+VIDEO_MODE_GENERATOR := Tools/generate_video_modes.py
+VIDEO_MODE_TABLE := Sources/ATEMVideoModeTable.inc
+PYTHON := /usr/bin/python3
 
 SOURCES := \
 	Sources/main.mm \
@@ -24,6 +32,7 @@ SOURCES := \
 	Sources/AudioWindowController.mm \
 	Sources/ColorWindowController.mm \
 	Sources/LabelsWindowController.mm \
+	Sources/MediaWindowController.mm \
 	Sources/HyperDeckWindowController.mm
 
 CXX := xcrun clang++
@@ -31,17 +40,30 @@ CXXFLAGS := -std=c++17 -fobjc-arc -fblocks -Wall -Wextra -Wno-deprecated-declara
 	-arch arm64 -arch x86_64 -mmacosx-version-min=13.0 -I"$(SDK_INCLUDE)" -I"Sources"
 LDFLAGS := -framework Cocoa -framework CoreFoundation
 
-.PHONY: all build package run demo preview preview-multiview preview-audio preview-color preview-labels preview-hyperdeck test diagnose clean verify requirements
+.PHONY: all build package run demo preview preview-multiview preview-audio preview-color preview-labels preview-media preview-hyperdeck test diagnose clean verify requirements video-modes
 
 all: build
 
 requirements:
-	@test -f "$(SDK_INCLUDE)/BMDSwitcherAPI.h" || \
+	@test -f "$(SDK_HEADER)" || \
 		(printf '%s\n' "Missing Blackmagic Switchers SDK at $(SDK_ROOT). Install ATEM Software Control with Developer SDK." >&2; exit 1)
 	@test -d "$(API_BUNDLE)" || \
 		(printf '%s\n' "Missing BMDSwitcherAPI.bundle. Install ATEM Software Control before building." >&2; exit 1)
+	@test -x "$(PYTHON)" || \
+		(printf '%s\n' "Missing $(PYTHON), needed to generate the video-standard table. Install the Apple Command Line Tools." >&2; exit 1)
 
-build: requirements
+# Regenerated on every build, so installing a new ATEM Software Control release picks
+# up its new video standards immediately and the table can never go stale.
+#
+# Deliberately a phony recipe rather than a file target with $(SDK_HEADER) as a
+# prerequisite: make splits prerequisites on whitespace, and the SDK path contains
+# spaces, so a file rule would look for a target called "/Applications/Blackmagic".
+# Regenerating unconditionally costs milliseconds and this Makefile recompiles every
+# source on every build regardless, so there is nothing to save by being clever.
+video-modes: requirements
+	@"$(PYTHON)" "$(VIDEO_MODE_GENERATOR)" --header "$(SDK_HEADER)" --output "$(VIDEO_MODE_TABLE)"
+
+build: requirements video-modes
 	@mkdir -p "$(MACOS_DIR)" "$(RESOURCES_DIR)" "$(HELPERS_DIR)"
 	$(CXX) $(CXXFLAGS) $(SOURCES) "$(SDK_DISPATCH)" -o "$(BINARY)" $(LDFLAGS)
 	$(CXX) $(CXXFLAGS) Sources/CameraHelperMain.mm "$(SDK_DISPATCH)" -o "$(CAMERA_HELPER)" $(LDFLAGS)
@@ -75,6 +97,9 @@ preview-color: build
 preview-labels: build
 	"$(BINARY)" --demo --render-labels-preview "$(BUILD_DIR)/labels-preview.png"
 
+preview-media: build
+	"$(BINARY)" --demo --render-media-preview "$(BUILD_DIR)/media-preview.png"
+
 preview-hyperdeck: build
 	"$(BINARY)" --demo --render-hyperdeck-preview "$(BUILD_DIR)/hyperdeck-preview.png"
 
@@ -90,3 +115,4 @@ verify: build test
 
 clean:
 	rm -rf "$(APP_BUNDLE)"
+	rm -f "$(VIDEO_MODE_TABLE)"

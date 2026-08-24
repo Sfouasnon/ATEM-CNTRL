@@ -5,6 +5,7 @@
 #import "ControlSurfaceWindowController.h"
 #import "HyperDeckWindowController.h"
 #import "LabelsWindowController.h"
+#import "MediaWindowController.h"
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 @property(nonatomic, strong) NSArray<ATEMController *> *controllers;
@@ -12,10 +13,12 @@
 @property(nonatomic, strong) AudioWindowController *audioWindowController;
 @property(nonatomic, strong) ColorWindowController *colorWindowController;
 @property(nonatomic, strong) LabelsWindowController *labelsWindowController;
+@property(nonatomic, strong) MediaWindowController *mediaWindowController;
 @property(nonatomic, strong) HyperDeckWindowController *hyperDeckWindowController;
 - (void)showAudioWindowForSession:(NSUInteger)sessionIndex;
 - (void)showColorWindowForSession:(NSUInteger)sessionIndex;
 - (void)showLabelsWindowForSession:(NSUInteger)sessionIndex;
+- (void)showMediaWindowForSession:(NSUInteger)sessionIndex;
 - (void)showHyperDeckWindowForSession:(NSUInteger)sessionIndex;
 @end
 
@@ -77,6 +80,10 @@
                                                action:@selector(showLabelsWindow:)
                                         keyEquivalent:@"5"];
     labels.target = self;
+    NSMenuItem *media = [windowMenu addItemWithTitle:@"Media / Color Generators"
+                                              action:@selector(showMediaWindow:)
+                                       keyEquivalent:@"6"];
+    media.target = self;
     [windowMenu addItem:NSMenuItem.separatorItem];
     [windowMenu addItemWithTitle:@"Bring All to Front" action:@selector(arrangeInFront:) keyEquivalent:@""];
     windowItem.submenu = windowMenu;
@@ -102,6 +109,8 @@
             [strongSelf showHyperDeckWindowForSession:sessionIndex];
         else if ([feature isEqualToString:@"labels"])
             [strongSelf showLabelsWindowForSession:sessionIndex];
+        else if ([feature isEqualToString:@"media"])
+            [strongSelf showMediaWindowForSession:sessionIndex];
     };
     [self.windowController showWindow:self];
     [self.windowController.window makeKeyAndOrderFront:self];
@@ -124,8 +133,9 @@
         NSArray<NSString *> *featureFlags = @[@"--render-audio-preview",
                                                @"--render-color-preview",
                                                @"--render-hyperdeck-preview",
-                                               @"--render-labels-preview"];
-        NSArray<NSString *> *featureNames = @[@"audio", @"color", @"hyperdeck", @"labels"];
+                                               @"--render-labels-preview",
+                                               @"--render-media-preview"];
+        NSArray<NSString *> *featureNames = @[@"audio", @"color", @"hyperdeck", @"labels", @"media"];
         for (NSUInteger index = 0; index < featureFlags.count; ++index) {
             renderIndex = [arguments indexOfObject:featureFlags[index]];
             if (renderIndex != NSNotFound) {
@@ -151,6 +161,9 @@
             } else if ([feature isEqualToString:@"labels"]) {
                 [self showLabelsWindowForSession:0];
                 renderController = self.labelsWindowController;
+            } else if ([feature isEqualToString:@"media"]) {
+                [self showMediaWindowForSession:0];
+                renderController = self.mediaWindowController;
             }
             void (^capture)(void) = ^{
                 NSView *contentView = renderController.window.contentView;
@@ -245,6 +258,21 @@
 {
     (void)sender;
     [self showLabelsWindowForSession:self.windowController.activeSessionIndex];
+}
+
+- (void)showMediaWindowForSession:(NSUInteger)sessionIndex
+{
+    if (!self.mediaWindowController)
+        self.mediaWindowController = [[MediaWindowController alloc] initWithControllers:self.controllers
+                                                                    initialSessionIndex:sessionIndex];
+    [self.mediaWindowController selectSessionIndex:sessionIndex];
+    [self showWindowController:self.mediaWindowController];
+}
+
+- (void)showMediaWindow:(id)sender
+{
+    (void)sender;
+    [self showMediaWindowForSession:self.windowController.activeSessionIndex];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender

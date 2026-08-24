@@ -10,6 +10,7 @@
 #include <cmath>
 
 #include "BMDSwitcherAPI.h"
+#include "ATEMColorMath.h"
 
 static NSString *const kATEMRuntimePath = @"/Library/Application Support/Blackmagic Design/Switchers/BMDSwitcherAPI.bundle";
 
@@ -73,6 +74,19 @@ NSNotificationName const ATEMStateDidChangeNotification = @"ATEMStateDidChangeNo
     return target;
 }
 
+@end
+
+
+@interface ATEMColorGeneratorState ()
+@property(nonatomic, readwrite) NSUInteger index;
+@property(nonatomic, readwrite) int64_t inputID;
+@property(nonatomic, copy, readwrite) NSString *name;
+@property(nonatomic, readwrite) double hue;
+@property(nonatomic, readwrite) double saturation;
+@property(nonatomic, readwrite) double luma;
+@end
+
+@implementation ATEMColorGeneratorState
 @end
 
 
@@ -278,6 +292,7 @@ NSNotificationName const ATEMStateDidChangeNotification = @"ATEMStateDidChangeNo
 @property(nonatomic, copy, readwrite) NSArray<ATEMAuxState *> *auxOutputs;
 @property(nonatomic, copy, readwrite) NSArray<ATEMMultiviewState *> *multiviews;
 @property(nonatomic, copy, readwrite) NSArray<ATEMLabelTargetState *> *labelTargets;
+@property(nonatomic, copy, readwrite) NSArray<ATEMColorGeneratorState *> *colorGenerators;
 @property(nonatomic, readwrite) uint32_t videoMode;
 @property(nonatomic, readwrite) BOOL canChangeVideoMode;
 @property(nonatomic, copy, readwrite) NSArray<ATEMVideoModeOption *> *supportedVideoModes;
@@ -413,6 +428,13 @@ struct InputAPIRecord
     IBMDSwitcherInput *api = nullptr;
 };
 
+struct ColorGeneratorAPIRecord
+{
+    int64_t inputID = 0;
+    IBMDSwitcherInputColor *api = nullptr;
+    __strong NSString *name = nil;
+};
+
 struct FairlightSourceAPIRecord
 {
     int64_t inputID = 0;
@@ -448,6 +470,15 @@ struct DemoHyperDeck
     NSInteger shuttleSpeed = 0;
 };
 
+struct DemoColorGenerator
+{
+    int64_t inputID = 0;
+    __strong NSString *name = nil;
+    double hue = 0;        // degrees
+    double saturation = 0; // 0...1
+    double luma = 0;       // 0...1
+};
+
 struct DemoMultiview
 {
     ATEMMultiviewLayout layout = ATEMMultiviewLayoutProgramTop;
@@ -461,7 +492,7 @@ struct DemoMultiview
 };
 
 template <typename T>
-struct PendingMultiviewValue
+struct PendingValue
 {
     bool active = false;
     T value {};
@@ -470,28 +501,28 @@ struct PendingMultiviewValue
 
 struct PendingMultiview
 {
-    PendingMultiviewValue<ATEMMultiviewLayout> layout;
-    PendingMultiviewValue<bool> programPreviewSwapped;
-    PendingMultiviewValue<double> vuMeterOpacity;
-    std::vector<PendingMultiviewValue<int64_t>> sources;
-    std::vector<PendingMultiviewValue<bool>> vuMeters;
-    std::vector<PendingMultiviewValue<bool>> safeAreas;
-    std::vector<PendingMultiviewValue<bool>> labels;
-    std::vector<PendingMultiviewValue<bool>> borders;
+    PendingValue<ATEMMultiviewLayout> layout;
+    PendingValue<bool> programPreviewSwapped;
+    PendingValue<double> vuMeterOpacity;
+    std::vector<PendingValue<int64_t>> sources;
+    std::vector<PendingValue<bool>> vuMeters;
+    std::vector<PendingValue<bool>> safeAreas;
+    std::vector<PendingValue<bool>> labels;
+    std::vector<PendingValue<bool>> borders;
 };
 
-static constexpr CFTimeInterval kMultiviewReadbackGracePeriod = 2.0;
+static constexpr CFTimeInterval kReadbackGracePeriod = 2.0;
 
 template <typename T>
-static void MarkPendingMultiviewValue(PendingMultiviewValue<T> &pending, T value)
+static void MarkPendingValue(PendingValue<T> &pending, T value)
 {
     pending.active = true;
     pending.value = value;
-    pending.expiresAt = CFAbsoluteTimeGetCurrent() + kMultiviewReadbackGracePeriod;
+    pending.expiresAt = CFAbsoluteTimeGetCurrent() + kReadbackGracePeriod;
 }
 
 template <typename T>
-static void ReconcilePendingMultiviewValue(PendingMultiviewValue<T> &pending,
+static void ReconcilePendingValue(PendingValue<T> &pending,
                                            HRESULT readResult,
                                            T *value)
 {
@@ -507,13 +538,14 @@ static void ReconcilePendingMultiviewValue(PendingMultiviewValue<T> &pending,
         pending.active = false;
 }
 
-static void ReconcilePendingMultiviewOpacity(PendingMultiviewValue<double> &pending,
-                                             HRESULT readResult,
-                                             double *value)
+static void ReconcilePendingDouble(PendingValue<double> &pending,
+                                   HRESULT readResult,
+                                   double *value,
+                                   double tolerance = 0.001)
 {
     if (!pending.active)
         return;
-    if (SUCCEEDED(readResult) && std::fabs(*value - pending.value) < 0.001) {
+    if (SUCCEEDED(readResult) && std::fabs(*value - pending.value) < tolerance) {
         pending.active = false;
         return;
     }
@@ -522,6 +554,17 @@ static void ReconcilePendingMultiviewOpacity(PendingMultiviewValue<double> &pend
     else
         pending.active = false;
 }
+
+// Colour-generator writes need the same echo suppression as multiview writes:
+// SetHue/SetSaturation/SetLuma return before the switcher acknowledges, so the
+// next 250 ms poll would otherwise snap a slider the user is still dragging
+// back to the pre-write value.
+struct PendingColorGenerator
+{
+    PendingValue<double> hue;
+    PendingValue<double> saturation;
+    PendingValue<double> luma;
+};
 
 static void EnsurePendingMultiviewWindowCount(PendingMultiview &pending, NSUInteger count)
 {
@@ -557,6 +600,8 @@ static void EnsurePendingMultiviewWindowCount(PendingMultiview &pending, NSUInte
     std::vector<IBMDSwitcherDownstreamKey *> _downstreamKeyAPIs;
     std::vector<InputAPIRecord> _inputAPIs;
     std::vector<AuxAPIRecord> _auxAPIs;
+    std::vector<ColorGeneratorAPIRecord> _colorGeneratorAPIs;
+    std::vector<PendingColorGenerator> _pendingColorGenerators;
     std::vector<IBMDSwitcherMultiView *> _multiviewAPIs;
     std::vector<PendingMultiview> _pendingMultiviews;
     NSArray<ATEMMultiviewState *> *_lastKnownMultiviews;
@@ -594,6 +639,7 @@ static void EnsurePendingMultiviewWindowCount(PendingMultiview &pending, NSUInte
     std::vector<bool> _demoDSKOnAir;
     std::vector<bool> _demoDSKTied;
     std::vector<int64_t> _demoAuxSources;
+    std::vector<DemoColorGenerator> _demoColorGenerators;
     std::vector<DemoMultiview> _demoMultiviews;
     std::vector<DemoAudioChannel> _demoAudioChannels;
     double _demoMasterAudioFader;
@@ -904,48 +950,28 @@ typedef struct {
     const char *frameRate;
 } ATEMVideoModeEntry;
 
-// Labels for the BMDSwitcherVideoMode values this app knows how to name, in the
-// order they should appear in the UI. The switcher is asked which of these it
-// actually supports, so listing a mode a given ATEM cannot run is harmless.
+// Every BMDSwitcherVideoMode the *installed* SDK header defines, with UI labels,
+// ordered by resolution and then by frame rate.
 //
-// MAINTENANCE: every symbol below must exist in the installed BMDSwitcherAPI.h.
-// If a build fails with "use of undeclared identifier bmdSwitcherVideoMode...",
-// delete that one line and rebuild — the numeric fallback probe below will still
-// surface the mode, just with a generic label.
+// The contents are GENERATED at build time by Tools/generate_video_modes.py, which
+// reads the enum straight out of BMDSwitcherAPI.h. That is deliberate. The enum gains
+// members with every SDK release — the 30 and 60 fps variants, higher resolutions —
+// and a hand-written list is wrong in two directions at once: it omits standards the
+// switcher can actually run, and it fails to compile the moment it names a symbol the
+// installed header does not define. Generating it means this app offers exactly the
+// set of standards the installed SDK knows about, no more and no less.
+//
+// Regenerate with `make video-modes`. Never hand-edit ATEMVideoModeTable.inc.
 static const ATEMVideoModeEntry kATEMVideoModeTable[] = {
-    { bmdSwitcherVideoMode525i5994NTSC,     "NTSC 4:3",   "59.94" },
-    { bmdSwitcherVideoMode525i5994Anamorphic, "NTSC 16:9",  "59.94" },
-    { bmdSwitcherVideoMode625i50PAL,        "PAL 4:3",    "50"    },
-    { bmdSwitcherVideoMode625i50Anamorphic, "PAL 16:9",   "50"    },
-    { bmdSwitcherVideoMode720p50,           "720p",       "50"    },
-    { bmdSwitcherVideoMode720p5994,         "720p",       "59.94" },
-    { bmdSwitcherVideoMode1080i50,          "1080i",      "50"    },
-    { bmdSwitcherVideoMode1080i5994,        "1080i",      "59.94" },
-    { bmdSwitcherVideoMode1080p2398,        "1080p",      "23.98" },
-    { bmdSwitcherVideoMode1080p24,          "1080p",      "24"    },
-    { bmdSwitcherVideoMode1080p25,          "1080p",      "25"    },
-    { bmdSwitcherVideoMode1080p2997,        "1080p",      "29.97" },
-    { bmdSwitcherVideoMode1080p50,          "1080p",      "50"    },
-    { bmdSwitcherVideoMode1080p5994,        "1080p",      "59.94" },
-    { bmdSwitcherVideoMode4KHDp2398,        "2160p",      "23.98" },
-    { bmdSwitcherVideoMode4KHDp24,          "2160p",      "24"    },
-    { bmdSwitcherVideoMode4KHDp25,          "2160p",      "25"    },
-    { bmdSwitcherVideoMode4KHDp2997,        "2160p",      "29.97" },
-    { bmdSwitcherVideoMode4KHDp50,          "2160p",      "50"    },
-    { bmdSwitcherVideoMode4KHDp5994,        "2160p",      "59.94" },
-    { bmdSwitcherVideoMode8KHDp2398,        "4320p",      "23.98" },
-    { bmdSwitcherVideoMode8KHDp24,          "4320p",      "24"    },
-    { bmdSwitcherVideoMode8KHDp25,          "4320p",      "25"    },
-    { bmdSwitcherVideoMode8KHDp2997,        "4320p",      "29.97" },
-    { bmdSwitcherVideoMode8KHDp50,          "4320p",      "50"    },
-    { bmdSwitcherVideoMode8KHDp5994,        "4320p",      "59.94" },
+#include "ATEMVideoModeTable.inc"
 };
 
 static const size_t kATEMVideoModeTableCount = sizeof(kATEMVideoModeTable) / sizeof(kATEMVideoModeTable[0]);
 
-// Upper bound for the fallback probe. BMDSwitcherVideoMode is a dense low-valued
-// enum; 128 covers every published value with headroom for future additions.
-static const uint32_t kATEMVideoModeProbeLimit = 128;
+// How far past the highest known enum value the fallback probe reaches, and the
+// value above which it gives up entirely. See refreshSupportedVideoModesLocked.
+static const uint32_t kATEMVideoModeProbeHeadroom = 32;
+static const uint32_t kATEMVideoModeProbeCeiling = 512;
 
 @interface ATEMVideoModeOption ()
 @property(nonatomic, readwrite) uint32_t rawMode;
@@ -989,6 +1015,19 @@ static NSArray<ATEMVideoModeOption *> *ATEMAllKnownVideoModes(void)
                                                         frameRate:@(entry.frameRate)]];
     }
     return [options copy];
+}
+
+/// Demo mode's starting standard, resolved from the generated table rather than by
+/// naming an SDK symbol here, so no BMDSwitcherVideoMode constant is referenced
+/// outside ATEMVideoModeTable.inc. Falls back to the first known mode.
+static uint32_t ATEMDefaultDemoVideoMode(void)
+{
+    for (size_t index = 0; index < kATEMVideoModeTableCount; ++index) {
+        const ATEMVideoModeEntry &entry = kATEMVideoModeTable[index];
+        if (std::strcmp(entry.format, "1080p") == 0 && std::strcmp(entry.frameRate, "59.94") == 0)
+            return (uint32_t)entry.mode;
+    }
+    return kATEMVideoModeTableCount > 0 ? (uint32_t)kATEMVideoModeTable[0].mode : 0;
 }
 
 static ATEMTransitionStyle AppTransitionStyle(BMDSwitcherTransitionStyle style)
@@ -1131,7 +1170,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     _labelStates = @[];
     _inputNamesByID = @{};
     _supportedVideoModes = @[];
-    _demoVideoMode = (uint32_t)bmdSwitcherVideoMode1080p5994;
+    _demoVideoMode = ATEMDefaultDemoVideoMode();
     _hyperDeckClipCache = [NSMutableDictionary dictionary];
     _hyperDeckClipCacheTimes = [NSMutableDictionary dictionary];
     _hyperDeckClipCacheCounts = [NSMutableDictionary dictionary];
@@ -1295,16 +1334,30 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
         [listed addObject:@((uint32_t)entry.mode)];
     }
 
-    // Any mode this build has no label for is still reachable rather than hidden.
-    for (uint32_t raw = 0; raw < kATEMVideoModeProbeLimit; ++raw) {
-        if ([listed containsObject:@(raw)])
-            continue;
-        bool supported = false;
-        if (FAILED(_switcher->DoesSupportVideoMode((BMDSwitcherVideoMode)raw, &supported)) || !supported)
-            continue;
-        [options addObject:[ATEMVideoModeOption optionWithRawMode:raw
-                                                           format:[NSString stringWithFormat:@"Mode %u", raw]
-                                                        frameRate:@""]];
+    // Safety net for a runtime newer than the SDK this app was compiled against.
+    // That is the normal case here, not a hypothetical: the Tahoe machines run the
+    // 10.3 runtime while the build links 10.0 headers, so a switcher can legitimately
+    // report a standard the generated table has no name for. Probe just past the
+    // highest known value and offer anything found as an unlabelled mode.
+    uint32_t highestKnown = 0;
+    for (size_t index = 0; index < kATEMVideoModeTableCount; ++index)
+        highestKnown = MAX(highestKnown, (uint32_t)kATEMVideoModeTable[index].mode);
+
+    // Only meaningful while BMDSwitcherVideoMode stays a small sequential enum. If a
+    // future SDK moves to FourCC-style values the range cannot contain anything, so
+    // skip it rather than burning several hundred pointless capability queries.
+    if (highestKnown < kATEMVideoModeProbeCeiling) {
+        uint32_t limit = MIN(highestKnown + kATEMVideoModeProbeHeadroom, kATEMVideoModeProbeCeiling);
+        for (uint32_t raw = 0; raw <= limit; ++raw) {
+            if ([listed containsObject:@(raw)])
+                continue;
+            bool supported = false;
+            if (FAILED(_switcher->DoesSupportVideoMode((BMDSwitcherVideoMode)raw, &supported)) || !supported)
+                continue;
+            [options addObject:[ATEMVideoModeOption optionWithRawMode:raw
+                                                               format:[NSString stringWithFormat:@"Mode %u", raw]
+                                                            frameRate:@""]];
+        }
     }
 
     _supportedVideoModes = [options copy];
@@ -1384,6 +1437,18 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
                                                   availabilityMask:(uint32_t)availability]];
             }
 
+            if (portType == bmdSwitcherPortTypeColorGenerator) {
+                IBMDSwitcherInputColor *colorGenerator = nullptr;
+                if (SUCCEEDED(input->QueryInterface(IID_IBMDSwitcherInputColor, (void **)&colorGenerator)) &&
+                    colorGenerator) {
+                    ColorGeneratorAPIRecord record;
+                    record.inputID = inputID;
+                    record.api = colorGenerator;
+                    record.name = displayName;
+                    _colorGeneratorAPIs.push_back(record);
+                }
+            }
+
             if (portType == bmdSwitcherPortTypeAuxOutput) {
                 IBMDSwitcherInputAux *aux = nullptr;
                 if (SUCCEEDED(input->QueryInterface(IID_IBMDSwitcherInputAux, (void **)&aux)) && aux) {
@@ -1404,6 +1469,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     _inputStates = [inputs copy];
     _labelStates = [labelTargets copy];
     _inputNamesByID = [inputNames copy];
+    _pendingColorGenerators.resize(_colorGeneratorAPIs.size());
 
     IBMDSwitcherKeyIterator *keyIterator = nullptr;
     if (SUCCEEDED(_mixEffectBlock->CreateIterator(IID_IBMDSwitcherKeyIterator, (void **)&keyIterator)) && keyIterator) {
@@ -1511,6 +1577,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     _demo = NO;
     _targetAddressLocked = @"";
     _demoMultiviews.clear();
+    _demoColorGenerators.clear();
     _demoAudioChannels.clear();
     _demoHyperDecks.clear();
     _pendingMultiviews.clear();
@@ -1547,6 +1614,15 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     for (IBMDSwitcherMultiView *multiview : _multiviewAPIs)
         multiview->Release();
     _multiviewAPIs.clear();
+
+    for (ColorGeneratorAPIRecord &record : _colorGeneratorAPIs) {
+        if (record.api)
+            record.api->Release();
+        record.api = nullptr;
+        record.name = nil;
+    }
+    _colorGeneratorAPIs.clear();
+    _pendingColorGenerators.clear();
 
     for (AuxAPIRecord &record : _auxAPIs) {
         if (record.api)
@@ -1722,12 +1798,30 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
         self->_demoStyle = ATEMTransitionStyleMix;
         self->_demoSelection = ATEMTransitionSelectionBackground;
         self->_demoRate = 25;
-        self->_demoVideoMode = (uint32_t)bmdSwitcherVideoMode1080p5994;
+        self->_demoVideoMode = ATEMDefaultDemoVideoMode();
         self->_demoFTB = NO;
         self->_demoKeys = std::vector<bool>(4, false);
         self->_demoDSKOnAir = std::vector<bool>(2, false);
         self->_demoDSKTied = std::vector<bool>(2, false);
         self->_demoAuxSources = std::vector<int64_t>(2, 1);
+        self->_demoColorGenerators.clear();
+        {
+            // Input IDs 10 and 11 are "Color 1" and "Color 2" in the demo input list above.
+            DemoColorGenerator colorOne;
+            colorOne.inputID = 10;
+            colorOne.name = @"Color 1";
+            colorOne.hue = 0.0;
+            colorOne.saturation = 0.0;
+            colorOne.luma = 0.5;  // neutral 50% gray
+            self->_demoColorGenerators.push_back(colorOne);
+            DemoColorGenerator colorTwo;
+            colorTwo.inputID = 11;
+            colorTwo.name = @"Color 2";
+            colorTwo.hue = 205.0;
+            colorTwo.saturation = 0.82;
+            colorTwo.luma = 0.46;
+            self->_demoColorGenerators.push_back(colorTwo);
+        }
         self->_demoMultiviews.clear();
         for (NSUInteger multiviewIndex = 0; multiviewIndex < 2; ++multiviewIndex) {
             DemoMultiview multiview;
@@ -1805,6 +1899,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     NSMutableArray<ATEMDownstreamKeyState *> *dsks = [NSMutableArray array];
     NSMutableArray<ATEMAuxState *> *auxes = [NSMutableArray array];
     NSMutableArray<ATEMMultiviewState *> *multiviews = [NSMutableArray array];
+    NSMutableArray<ATEMColorGeneratorState *> *colorGenerators = [NSMutableArray array];
 
     if (_demo) {
         state.programInputID = _demoProgram;
@@ -1834,6 +1929,17 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
                                                                                  [NSString stringWithFormat:@"Aux %lu", (unsigned long)index + 1])
                                                        sourceID:_demoAuxSources[index]
                                           inputAvailabilityMask:0xFFFFFFFFU]];
+        }
+        for (NSUInteger index = 0; index < _demoColorGenerators.size(); ++index) {
+            const DemoColorGenerator &demoColor = _demoColorGenerators[index];
+            ATEMColorGeneratorState *generator = [[ATEMColorGeneratorState alloc] init];
+            generator.index = index;
+            generator.inputID = demoColor.inputID;
+            generator.name = LabelLongNameForID(_labelStates, demoColor.inputID, demoColor.name);
+            generator.hue = demoColor.hue;
+            generator.saturation = demoColor.saturation;
+            generator.luma = demoColor.luma;
+            [colorGenerators addObject:generator];
         }
         for (NSUInteger index = 0; index < _demoMultiviews.size(); ++index) {
             const DemoMultiview &demoMultiview = _demoMultiviews[index];
@@ -1964,6 +2070,31 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
                                                        sourceID:sourceID
                                           inputAvailabilityMask:_auxAPIs[index].inputAvailabilityMask]];
         }
+        if (_pendingColorGenerators.size() < _colorGeneratorAPIs.size())
+            _pendingColorGenerators.resize(_colorGeneratorAPIs.size());
+        for (NSUInteger index = 0; index < _colorGeneratorAPIs.size(); ++index) {
+            ColorGeneratorAPIRecord &record = _colorGeneratorAPIs[index];
+            PendingColorGenerator &pending = _pendingColorGenerators[index];
+            ATEMColorGeneratorState *generator = [[ATEMColorGeneratorState alloc] init];
+            generator.index = index;
+            generator.inputID = record.inputID;
+            generator.name = _inputNamesByID[@(record.inputID)] ?: record.name
+                ?: [NSString stringWithFormat:@"Color %lu", (unsigned long)index + 1];
+
+            double hue = 0, saturation = 0, luma = 0;
+            HRESULT hueResult = record.api->GetHue(&hue);
+            HRESULT saturationResult = record.api->GetSaturation(&saturation);
+            HRESULT lumaResult = record.api->GetLuma(&luma);
+            // Hue is reported in degrees, so it needs a wider acknowledgement
+            // tolerance than the 0...1 parameters.
+            ReconcilePendingDouble(pending.hue, hueResult, &hue, 0.1);
+            ReconcilePendingDouble(pending.saturation, saturationResult, &saturation);
+            ReconcilePendingDouble(pending.luma, lumaResult, &luma);
+            generator.hue = ATEMWrapDegrees(hue);
+            generator.saturation = ATEMClamp01(saturation);
+            generator.luma = ATEMClamp01(luma);
+            [colorGenerators addObject:generator];
+        }
         if (_pendingMultiviews.size() < _multiviewAPIs.size())
             _pendingMultiviews.resize(_multiviewAPIs.size());
         for (NSUInteger index = 0; index < _multiviewAPIs.size(); ++index) {
@@ -1981,7 +2112,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
             HRESULT layoutResult = api->GetLayout(&layout);
             if (SUCCEEDED(layoutResult))
                 appLayout = (ATEMMultiviewLayout)layout;
-            ReconcilePendingMultiviewValue(pending.layout, layoutResult, &appLayout);
+            ReconcilePendingValue(pending.layout, layoutResult, &appLayout);
             multiview.layout = appLayout;
             boolValue = false;
             multiview.supportsQuadrantLayout = SUCCEEDED(api->SupportsQuadrantLayout(&boolValue))
@@ -2004,7 +2135,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
             HRESULT opacityResult = api->GetVuMeterOpacity(&opacity);
             if (FAILED(opacityResult))
                 opacity = previousOpacity;
-            ReconcilePendingMultiviewOpacity(pending.vuMeterOpacity, opacityResult, &opacity);
+            ReconcilePendingDouble(pending.vuMeterOpacity, opacityResult, &opacity);
             multiview.vuMeterOpacity = opacity;
             boolValue = false;
             multiview.canToggleSafeArea = SUCCEEDED(api->CanToggleSafeAreaEnabled(&boolValue))
@@ -2021,7 +2152,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
             HRESULT swappedResult = api->GetProgramPreviewSwapped(&swapped);
             if (FAILED(swappedResult))
                 swapped = previousSwapped;
-            ReconcilePendingMultiviewValue(pending.programPreviewSwapped, swappedResult, &swapped);
+            ReconcilePendingValue(pending.programPreviewSwapped, swappedResult, &swapped);
             multiview.programPreviewSwapped = swapped;
             boolValue = false;
             multiview.canChangeOverlayProperties = SUCCEEDED(api->CanChangeOverlayProperties(&boolValue))
@@ -2058,7 +2189,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
                 HRESULT sourceResult = api->GetWindowInput(windowIndex, &sourceID);
                 if (FAILED(sourceResult))
                     sourceID = previousSourceID;
-                ReconcilePendingMultiviewValue(pending.sources[windowIndex], sourceResult, &sourceID);
+                ReconcilePendingValue(pending.sources[windowIndex], sourceResult, &sourceID);
                 window.sourceID = sourceID;
                 boolValue = false;
                 window.supportsVUMeter = SUCCEEDED(api->CurrentInputSupportsVuMeter(windowIndex, &boolValue))
@@ -2068,7 +2199,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
                 HRESULT vuMeterResult = api->GetVuMeterEnabled(windowIndex, &vuMeterEnabled);
                 if (FAILED(vuMeterResult))
                     vuMeterEnabled = previousVUMeterEnabled;
-                ReconcilePendingMultiviewValue(pending.vuMeters[windowIndex], vuMeterResult, &vuMeterEnabled);
+                ReconcilePendingValue(pending.vuMeters[windowIndex], vuMeterResult, &vuMeterEnabled);
                 window.vuMeterEnabled = vuMeterEnabled;
                 boolValue = false;
                 window.supportsSafeArea = SUCCEEDED(api->CurrentInputSupportsSafeArea(windowIndex, &boolValue))
@@ -2078,7 +2209,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
                 HRESULT safeAreaResult = api->GetSafeAreaEnabled(windowIndex, &safeAreaEnabled);
                 if (FAILED(safeAreaResult))
                     safeAreaEnabled = previousSafeAreaEnabled;
-                ReconcilePendingMultiviewValue(pending.safeAreas[windowIndex], safeAreaResult, &safeAreaEnabled);
+                ReconcilePendingValue(pending.safeAreas[windowIndex], safeAreaResult, &safeAreaEnabled);
                 window.safeAreaEnabled = safeAreaEnabled;
                 BMDSwitcherMultiViewSafeAreaType safeAreaType = (BMDSwitcherMultiViewSafeAreaType)(previousWindow ? previousWindow.safeAreaType : (uint32_t)bmdSwitcherMultiViewSafeAreaTypeAspect16x9);
                 HRESULT safeAreaTypeResult = api->GetSafeAreaType(windowIndex, &safeAreaType);
@@ -2092,14 +2223,14 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
                 HRESULT labelResult = api->GetLabelVisible(windowIndex, &labelVisible);
                 if (FAILED(labelResult))
                     labelVisible = previousLabelVisible;
-                ReconcilePendingMultiviewValue(pending.labels[windowIndex], labelResult, &labelVisible);
+                ReconcilePendingValue(pending.labels[windowIndex], labelResult, &labelVisible);
                 window.labelVisible = labelVisible;
                 bool previousBorderVisible = previousWindow ? previousWindow.isBorderVisible : false;
                 bool borderVisible = previousBorderVisible;
                 HRESULT borderResult = api->GetBorderVisible(windowIndex, &borderVisible);
                 if (FAILED(borderResult))
                     borderVisible = previousBorderVisible;
-                ReconcilePendingMultiviewValue(pending.borders[windowIndex], borderResult, &borderVisible);
+                ReconcilePendingValue(pending.borders[windowIndex], borderResult, &borderVisible);
                 window.borderVisible = borderVisible;
                 [windows addObject:window];
             }
@@ -2113,6 +2244,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     state.downstreamKeys = dsks;
     state.auxOutputs = auxes;
     state.multiviews = multiviews;
+    state.colorGenerators = colorGenerators;
 
     NSString *targetAddress = [_targetAddressLocked copy] ?: @"";
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -2613,6 +2745,39 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
     });
 }
 
+- (void)setColorGenerator:(NSUInteger)index
+                      hue:(double)hue
+               saturation:(double)saturation
+                     luma:(double)luma
+{
+    double wrappedHue = ATEMWrapDegrees(hue);
+    double clampedSaturation = ATEMClamp01(saturation);
+    double clampedLuma = ATEMClamp01(luma);
+    dispatch_async(_controlQueue, ^{
+        if (self->_demo) {
+            if (index < self->_demoColorGenerators.size()) {
+                self->_demoColorGenerators[index].hue = wrappedHue;
+                self->_demoColorGenerators[index].saturation = clampedSaturation;
+                self->_demoColorGenerators[index].luma = clampedLuma;
+            }
+        } else if (index < self->_colorGeneratorAPIs.size()) {
+            IBMDSwitcherInputColor *api = self->_colorGeneratorAPIs[index].api;
+            if (self->_pendingColorGenerators.size() <= index)
+                self->_pendingColorGenerators.resize(index + 1);
+            PendingColorGenerator &pending = self->_pendingColorGenerators[index];
+            // As everywhere else in this file, only S_OK counts as an acknowledged
+            // write; the SDK's S_FALSE no-op means the value already matched.
+            if (api->SetHue(wrappedHue) == S_OK)
+                MarkPendingValue(pending.hue, wrappedHue);
+            if (api->SetSaturation(clampedSaturation) == S_OK)
+                MarkPendingValue(pending.saturation, clampedSaturation);
+            if (api->SetLuma(clampedLuma) == S_OK)
+                MarkPendingValue(pending.luma, clampedLuma);
+        }
+        [self publishStateLocked];
+    });
+}
+
 - (void)setLabelForInput:(int64_t)inputID longName:(NSString *)longName shortName:(NSString *)shortName
 {
     NSString *requestedLongName = [longName stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
@@ -2719,7 +2884,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
             if (result == S_OK) {
                 if (self->_pendingMultiviews.size() <= index)
                     self->_pendingMultiviews.resize(index + 1);
-                MarkPendingMultiviewValue(self->_pendingMultiviews[index].layout, layout);
+                MarkPendingValue(self->_pendingMultiviews[index].layout, layout);
             }
         }
         [self publishStateLocked];
@@ -2736,7 +2901,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
             if (result == S_OK) {
                 if (self->_pendingMultiviews.size() <= index)
                     self->_pendingMultiviews.resize(index + 1);
-                MarkPendingMultiviewValue(self->_pendingMultiviews[index].programPreviewSwapped, (bool)swapped);
+                MarkPendingValue(self->_pendingMultiviews[index].programPreviewSwapped, (bool)swapped);
             }
         }
         [self publishStateLocked];
@@ -2754,7 +2919,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
             if (result == S_OK) {
                 if (self->_pendingMultiviews.size() <= index)
                     self->_pendingMultiviews.resize(index + 1);
-                MarkPendingMultiviewValue(self->_pendingMultiviews[index].vuMeterOpacity, clamped);
+                MarkPendingValue(self->_pendingMultiviews[index].vuMeterOpacity, clamped);
             }
         }
         [self publishStateLocked];
@@ -2778,7 +2943,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
                 if (self->_pendingMultiviews.size() <= index)
                     self->_pendingMultiviews.resize(index + 1);
                 EnsurePendingMultiviewWindowCount(self->_pendingMultiviews[index], window + 1);
-                MarkPendingMultiviewValue(self->_pendingMultiviews[index].sources[window], sourceID);
+                MarkPendingValue(self->_pendingMultiviews[index].sources[window], sourceID);
             }
         }
         [self publishStateLocked];
@@ -2796,7 +2961,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
                 if (self->_pendingMultiviews.size() <= index)
                     self->_pendingMultiviews.resize(index + 1);
                 EnsurePendingMultiviewWindowCount(self->_pendingMultiviews[index], window + 1);
-                MarkPendingMultiviewValue(self->_pendingMultiviews[index].vuMeters[window], (bool)enabled);
+                MarkPendingValue(self->_pendingMultiviews[index].vuMeters[window], (bool)enabled);
             }
         }
         [self publishStateLocked];
@@ -2814,7 +2979,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
                 if (self->_pendingMultiviews.size() <= index)
                     self->_pendingMultiviews.resize(index + 1);
                 EnsurePendingMultiviewWindowCount(self->_pendingMultiviews[index], window + 1);
-                MarkPendingMultiviewValue(self->_pendingMultiviews[index].safeAreas[window], (bool)enabled);
+                MarkPendingValue(self->_pendingMultiviews[index].safeAreas[window], (bool)enabled);
             }
         }
         [self publishStateLocked];
@@ -2832,7 +2997,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
                 if (self->_pendingMultiviews.size() <= index)
                     self->_pendingMultiviews.resize(index + 1);
                 EnsurePendingMultiviewWindowCount(self->_pendingMultiviews[index], window + 1);
-                MarkPendingMultiviewValue(self->_pendingMultiviews[index].labels[window], (bool)visible);
+                MarkPendingValue(self->_pendingMultiviews[index].labels[window], (bool)visible);
             }
         }
         [self publishStateLocked];
@@ -2850,7 +3015,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
                 if (self->_pendingMultiviews.size() <= index)
                     self->_pendingMultiviews.resize(index + 1);
                 EnsurePendingMultiviewWindowCount(self->_pendingMultiviews[index], window + 1);
-                MarkPendingMultiviewValue(self->_pendingMultiviews[index].borders[window], (bool)visible);
+                MarkPendingValue(self->_pendingMultiviews[index].borders[window], (bool)visible);
             }
         }
         [self publishStateLocked];
@@ -2879,7 +3044,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
             EnsurePendingMultiviewWindowCount(self->_pendingMultiviews[index], windowCount);
             for (uint32_t window = 0; window < windowCount; ++window) {
                 if (api->SetLabelVisible(window, visible) == S_OK)
-                    MarkPendingMultiviewValue(self->_pendingMultiviews[index].labels[window], (bool)visible);
+                    MarkPendingValue(self->_pendingMultiviews[index].labels[window], (bool)visible);
             }
         }
         [self publishStateLocked];
@@ -2908,7 +3073,7 @@ static NSString *ConnectionFailureMessage(BMDSwitcherConnectToFailure failure)
             EnsurePendingMultiviewWindowCount(self->_pendingMultiviews[index], windowCount);
             for (uint32_t window = 0; window < windowCount; ++window) {
                 if (api->SetBorderVisible(window, visible) == S_OK)
-                    MarkPendingMultiviewValue(self->_pendingMultiviews[index].borders[window], (bool)visible);
+                    MarkPendingValue(self->_pendingMultiviews[index].borders[window], (bool)visible);
             }
         }
         [self publishStateLocked];
@@ -3325,6 +3490,53 @@ int ATEMRunSelfTest(void)
             return 14;
         printf("quadrant physical window mapping (all 16 layouts): ok\n");
 
+        // Colour-generator maths. 75% SMPTE bars are the reference case: every
+        // bar is a pair of 0.0/0.75 primaries, which must land on saturation
+        // 100% and luma 37.5% with only the hue changing.
+        const double barComponents[6][3] = {
+            {0.75, 0.75, 0.00},  // yellow
+            {0.00, 0.75, 0.75},  // cyan
+            {0.00, 0.75, 0.00},  // green
+            {0.75, 0.00, 0.75},  // magenta
+            {0.75, 0.00, 0.00},  // red
+            {0.00, 0.00, 0.75},  // blue
+        };
+        const double expectedBarHues[6] = {60.0, 180.0, 120.0, 300.0, 0.0, 240.0};
+        for (size_t barIndex = 0; barIndex < 6; ++barIndex) {
+            ATEMHSL hsl = ATEMHSLFromRGB(barComponents[barIndex][0],
+                                         barComponents[barIndex][1],
+                                         barComponents[barIndex][2]);
+            if (std::fabs(hsl.hue - expectedBarHues[barIndex]) > 0.001 ||
+                std::fabs(hsl.saturation - 1.0) > 0.001 ||
+                std::fabs(hsl.luma - 0.375) > 0.001)
+                return 15;
+            ATEMRGB rgb = ATEMRGBFromHSL(hsl.hue, hsl.saturation, hsl.luma);
+            if (std::fabs(rgb.red - barComponents[barIndex][0]) > 0.001 ||
+                std::fabs(rgb.green - barComponents[barIndex][1]) > 0.001 ||
+                std::fabs(rgb.blue - barComponents[barIndex][2]) > 0.001)
+                return 15;
+        }
+        // A neutral has zero saturation and survives the round trip unchanged.
+        ATEMHSL neutral = ATEMHSLFromRGB(0.5, 0.5, 0.5);
+        if (std::fabs(neutral.saturation) > 1e-9 || std::fabs(neutral.luma - 0.5) > 1e-9)
+            return 15;
+        printf("HSL colour conversion (75%% bars round trip): ok\n");
+
+        // One stop is a doubling of emitted light, not of the signal number, so
+        // it scales luma by 2^(1/gamma). Up then down must return where it started.
+        double exposedUp = ATEMLumaAfterStops(0.5, 1.0);
+        if (std::fabs(exposedUp - 0.5 * std::pow(2.0, 1.0 / kATEMDisplayGamma)) > 1e-9 ||
+            std::fabs(ATEMLumaAfterStops(exposedUp, -1.0) - 0.5) > 1e-9 ||
+            std::fabs(ATEMStopsBetweenLuma(0.5, exposedUp) - 1.0) > 1e-9 ||
+            std::fabs(ATEMStopsBetweenLuma(0.5, 0.5)) > 1e-9)
+            return 16;
+        // Black has no light to double, and nothing may exceed legal white.
+        if (ATEMLumaAfterStops(0.0, 4.0) != 0.0 ||
+            ATEMLumaAfterStops(0.9, 6.0) != 1.0 ||
+            ATEMStopsBetweenLuma(0.0, 0.5) != 0.0)
+            return 16;
+        printf("exposure offset in stops: ok\n");
+
         ATEMController *controller = [[ATEMController alloc] init];
         ATEMController *secondController = [[ATEMController alloc] init];
         __block ATEMState *observedState = nil;
@@ -3541,6 +3753,41 @@ int ATEMRunSelfTest(void)
             [secondController shutdown];
             return 11;
         }
+        // Colour generators: set Color 1 to a 40% gray, then expose it down a
+        // third of a stop the way the Media window does, and check the model
+        // followed both writes.
+        double startingLuma = 0.4;
+        [controller setColorGenerator:0 hue:0 saturation:0 luma:startingLuma];
+        deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+        while (std::fabs(controller.latestState.colorGenerators.firstObject.luma - startingLuma) > 0.001 &&
+               deadline.timeIntervalSinceNow > 0) {
+            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
+        }
+        ATEMColorGeneratorState *colorOne = controller.latestState.colorGenerators.firstObject;
+        if (controller.latestState.colorGenerators.count != 2 ||
+            !colorOne ||
+            colorOne.inputID != 10 ||
+            std::fabs(colorOne.luma - startingLuma) > 0.001 ||
+            std::fabs(colorOne.saturation) > 0.001) {
+            [controller shutdown];
+            [secondController shutdown];
+            return 17;
+        }
+        double exposedDown = ATEMLumaAfterStops(colorOne.luma, -1.0 / 3.0);
+        [controller setColorGenerator:0 hue:colorOne.hue saturation:colorOne.saturation luma:exposedDown];
+        deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+        while (std::fabs(controller.latestState.colorGenerators.firstObject.luma - exposedDown) > 0.001 &&
+               deadline.timeIntervalSinceNow > 0) {
+            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
+        }
+        if (std::fabs(ATEMStopsBetweenLuma(startingLuma,
+                                           controller.latestState.colorGenerators.firstObject.luma) + 1.0 / 3.0) > 0.001 ||
+            std::fabs(controller.latestState.colorGenerators[1].hue - 205.0) > 0.001) {
+            [controller shutdown];
+            [secondController shutdown];
+            return 17;
+        }
+
         [controller setAudioInput:1 source:0 faderGain:-12.0];
         [controller recordHyperDeck:1];
         [controller setHyperDeck:1 currentClip:9001];
@@ -3570,6 +3817,7 @@ int ATEMRunSelfTest(void)
         printf("Fairlight audio model: ok\n");
         printf("HyperDeck transport model: ok\n");
         printf("HyperDeck opaque clip IDs: ok\n");
+        printf("colour generator model and exposure offset: ok\n");
         printf("self-test: passed\n");
         return 0;
     }

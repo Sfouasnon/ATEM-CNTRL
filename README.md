@@ -17,7 +17,7 @@ Version 0.4 expands the compact live switcher console with dedicated Fairlight A
 - CUT, AUTO, Fade to Black, and a continuous T-bar
 - MIX, DIP, WIPE, DVE, and STINGER next-transition selection
 - Transition rate and Background/Key transition selection, with the rate field and stepper protected from being overwritten by the state poll while you edit them
-- Switcher video standard selection with separate Format and Frame Rate menus, built from the switcher's own `DoesSupportVideoMode` answers and confirmed before it is applied
+- Switcher video standard selection with separate Format and Frame Rate menus, offering every standard the installed SDK defines — 23.98, 24, 25, 29.97, 30, 50, 59.94, 60 and beyond, at each resolution the switcher reports — filtered by the switcher's own `DoesSupportVideoMode` answers and confirmed before it is applied
 - Up to four upstream key On Air controls, when available
 - Downstream key Tie, On Air, and Auto controls
 - AUX output routing
@@ -34,9 +34,10 @@ Version 0.4 expands the compact live switcher console with dedicated Fairlight A
 - Dedicated Fairlight Audio window with a horizontal mixer, stereo meters, peak markers, rolling level history, source faders, pan, Off/On/AFV, master fader, and peak reset
 - Dedicated HyperDeck window with ATEM-managed IPv4 configuration, associated switcher input, connection/remote/model status, real SDK clip IDs/names/durations, timecode state, Play/Stop/Record/Jog/Shuttle, Loop, Single Clip, and Auto-roll
 - Dedicated Camera/Color window with Lift, Gamma, Gain, Offset, Contrast, Luma Mix, Hue, Saturation, per-stage reset, and full color reset
+- Dedicated Media window for the colour generators: macOS colour picker, hex entry, hue/saturation/luma sliders, an exposure control calibrated in stops of emitted light, grayscale and 75% colour-bar presets, and one-click routing of the generator to Preview or Program
 - Explicit, restartable camera-control engine that runs outside the main app and is terminated if startup stalls, the ATEM disconnects, or its target address changes
 - Independent A/B target selectors in every feature window
-- Window-menu shortcuts: Switcher Console `⌘1`, Audio `⌘2`, Camera/Color `⌘3`, HyperDeck `⌘4`, and Input & Output Labels `⌘5`
+- Window-menu shortcuts: Switcher Console `⌘1`, Audio `⌘2`, Camera/Color `⌘3`, HyperDeck `⌘4`, Input & Output Labels `⌘5`, and Media / Color Generators `⌘6`
 - Live state polling plus Blackmagic SDK event callbacks
 - A no-hardware Demo mode
 - Offline rendering, diagnostics, runtime checks, and ad-hoc code signing
@@ -61,11 +62,35 @@ Camera controls are capability-checked in the helper before a read or write. The
 
 The Fairlight API likewise exposes level and peak values in dBFS rather than PCM samples. The Audio window’s live “waveforms” are rolling histories of those official level callbacks.
 
+## Exposing a colour generator in stops
+
+The Media window exists for one job: put a known flat colour on a wall or a monitor, then move its brightness up or down by a photographic amount without changing the colour.
+
+The ATEM describes a colour generator as hue, saturation, and luma. Luma is a **signal level**, not an amount of light — so halving the number does not halve the light the wall emits. A Rec.709 display or an LED processor applies a gamma of roughly 2.4 to the signal before anything is emitted. One stop down therefore scales luma by `2^(-1/2.4)`, about 0.75, not by 0.5.
+
+The `−1`, `−⅔`, `−⅓`, `+⅓`, `+⅔`, `+1` buttons do exactly that arithmetic. The readout next to the luma slider shows how far you have ridden the colour away from the last one you actually chose, in stops, so "we set the gray card, then came down a third" stays legible. Picking a new colour — the picker, a hex value, or any preset — re-arms that reference.
+
+The grayscale presets are named for what they are metering:
+
+| Button | Luma sent | Meaning |
+| --- | --- | --- |
+| `BLACK` | 0.0% | Full black |
+| `18% GRAY` | 40.9% | An 18% reflectance gray card through the Rec.709 curve |
+| `50%` | 50.0% | Half signal, the usual LED-wall alignment gray |
+| `90% WHITE` | 94.9% | A 90% reflectance white card through the Rec.709 curve |
+| `100%` | 100.0% | Peak white |
+
+The `75% colour bars` row sets the six standard bars, each of which is saturation 100% at luma 37.5% with only the hue changing. Under the swatch, the window also prints the 10-bit legal-range code value, which is what an LED-wall processor is measuring.
+
+Colour-generator writes use the same echo suppression as the transition rate field and the multiview writes: a `SetLuma` call returns before the switcher acknowledges it, so for a second after a local write the UI keeps showing what you asked for rather than letting the 250 ms poll drag the slider back under your hand. Slider drags are coalesced to one switcher write per 40 ms.
+
+Colour generators are stored on the switcher. Whatever you leave them set to survives quitting the app.
+
 ## Remaining scope
 
 These ATEM Software Control areas are not implemented yet:
 
-- Media-pool transfer and media-player pages
+- Media-pool transfer and media-player stills/clips (the Media window currently covers the colour generators only)
 - Streaming and ISO recording pages
 - Macros, SuperSource, and the remaining general switcher setup controls (multiview standard, down-conversion, 3G-SDI output level, label sets)
 - Full Fairlight EQ/dynamics/effects editors and legacy non-Fairlight mixer fallback
@@ -98,6 +123,14 @@ open "build/ATEM CNTRL.app"
 The built app is `build/ATEM CNTRL.app`. It is ad-hoc signed for local testing. Distribution to other Macs should use a Developer ID certificate and notarization.
 The Makefile produces a universal Apple Silicon/Intel binary.
 
+### Generated video-standard table
+
+`build` first generates `Sources/ATEMVideoModeTable.inc` by running `Tools/generate_video_modes.py` over the installed `BMDSwitcherAPI.h`. The script reads the `BMDSwitcherVideoMode` enum, decodes each name into a resolution and a frame rate (`bmdSwitcherVideoMode1080p2997` becomes `1080p` at `29.97`), sorts them, and emits the table the Video Standard menus are built from.
+
+This is generated rather than hand-written because the enum grows with each SDK release. A fixed list is wrong twice over: it hides frame rates the switcher can actually run, and it stops compiling the moment it names a symbol the installed header does not define. Generating it means the app always offers exactly the standards the installed SDK knows about, and installing a newer ATEM Software Control picks up its additions on the next build.
+
+The file is regenerated on every build, so it cannot go stale; it is not committed, and `make video-modes` regenerates it on its own. Do not edit it directly. Any standard the switcher reports that the table cannot name — possible when the 10.3 runtime is paired with 10.0 headers — is still selectable, listed as `Mode <n>`.
+
 Useful commands:
 
 ```sh
@@ -107,7 +140,9 @@ make preview-multiview # render the multiview editor to build/multiview-preview.
 make preview-audio # render the dedicated audio window
 make preview-color # render the dedicated color window
 make preview-labels # render the Input & Output Labels window
+make preview-media # render the Media / colour generator window
 make preview-hyperdeck # render the dedicated HyperDeck window
+make video-modes # regenerate the video-standard table from the installed SDK header
 make test       # validate runtime loading and enum mappings
 make diagnose   # print OS, architecture, and runtime details
 make verify     # build, self-test, verify signature, and lint the plist
@@ -126,11 +161,12 @@ Use a switcher that is not carrying an irreplaceable live output for the first t
 6. Open Audio, confirm channel names and idle levels, then move one non-critical source fader and return it to its original value.
 7. Open HyperDeck, verify each slot’s existing address before changing anything, then test transport only on non-critical media. The ATEM owns the TCP 9993 connection; the Mac does not connect directly to the deck.
 8. Open Camera/Color and start the isolated engine. Read values first; test one small change on a non-critical camera, reset it, then stop and restart the helper once.
-9. On a non-critical multiview window, test source routing and one overlay toggle, then confirm the ATEM output follows it.
-10. Select a known-safe Preview input and test CUT/AUTO only after confirming the output is safe to change.
-11. Select session B, connect the second ATEM, and confirm session A remains connected before issuing a safe command on each unit and in each feature window.
-12. Leave both connected for at least ten minutes and exercise reconnect once on each session.
-13. If the main app hangs, capture a fresh sample with `sample ATEMCNTRL 10 -file ATEMCNTRL.sample.txt` before force-quitting. If only Color stalls, stop the isolated engine and retain its status message.
+9. Open Media, note the existing Color 1 and Color 2 values before changing anything, set Color 2 to `50%` gray, route it to **Preview** — never Program on a live switcher — confirm the multiview follows, ride it one stop down and back, then restore the original values.
+10. On a non-critical multiview window, test source routing and one overlay toggle, then confirm the ATEM output follows it.
+11. Select a known-safe Preview input and test CUT/AUTO only after confirming the output is safe to change.
+12. Select session B, connect the second ATEM, and confirm session A remains connected before issuing a safe command on each unit and in each feature window.
+13. Leave both connected for at least ten minutes and exercise reconnect once on each session.
+14. If the main app hangs, capture a fresh sample with `sample ATEMCNTRL 10 -file ATEMCNTRL.sample.txt` before force-quitting. If only Color stalls, stop the isolated engine and retain its status message.
 
 No ATEM advertised `_blackmagic._tcp` on the development machine's current network, so live hardware behavior could not be verified here.
 

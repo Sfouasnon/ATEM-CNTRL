@@ -1,7 +1,7 @@
 # Architecture
 
 ```text
-       Switcher Console       Audio       HyperDeck       Camera / Color
+  Switcher Console   Audio   HyperDeck   Media / Color Gens   Camera / Color
               │                 │             │                  │
               └──── immutable snapshots + A/B target selection ─┤
                                 │                                │ bounded,
@@ -23,6 +23,12 @@ Fairlight callbacks copy their level and peak arrays immediately, enqueue them o
 HyperDeck control stays inside the ATEM session. `SetNetworkAddress` programs the selected ATEM’s HyperDeck slot; the ATEM hardware, not the Mac, then owns the TCP 9993 connection to the deck. IPv4 addresses use the SDK’s documented least-significant-byte-first packing and have a self-test round trip. Clip menus are populated by `IBMDSwitcherHyperDeckClipIterator`; clip IDs are treated as opaque values and are never synthesized from the reported clip count.
 
 Camera control is the deliberate exception to in-process ownership. The main app does not query `IBMDSwitcherCameraControl`. On explicit user request it launches `ATEMCameraHelper`, which creates an independent connection to exactly one selected ATEM and owns every camera-control pointer and call. IPC writes occur on a separate serial queue, keep exactly one command outstanding until its reply, and coalesce pending commands by operation/camera/parameter, so a hung helper cannot back-pressure AppKit. An eight-second startup watchdog, a three-second command watchdog, and TERM-to-KILL escalation make the subsystem restartable. Camera adjustments remain disabled until every color parameter for the newly selected camera has been read back. Changing sessions, disconnecting, changing the target address, or closing the Color window stops the helper.
+
+Colour generators are read and written through `IBMDSwitcherInputColor`, queried off the `IBMDSwitcherInput` objects whose port type is `bmdSwitcherPortTypeColorGenerator` during the same enumeration pass that builds the input, label, and AUX tables. They publish as immutable `ATEMColorGeneratorState` snapshots carrying the SDK input ID, so the Media window can route a generator to Program or Preview without ever holding an SDK pointer.
+
+Writes to a generator reuse the pending-value reconciliation the multiview writes introduced — the `PendingValue<T>` helpers are shared rather than duplicated. `SetHue`, `SetSaturation`, and `SetLuma` each return before the switcher acknowledges, so an unguarded 250 ms poll would drag a slider back mid-drag. Only `S_OK` marks a value pending; the SDK's `S_FALSE` no-op means the switcher already held that value. Hue is reconciled with a wider tolerance than saturation and luma because it is reported in degrees rather than 0...1.
+
+Exposure arithmetic lives in `Sources/ATEMColorMath.h`, a header-only file free of AppKit and SDK types so the `--self-test` in `ATEMController.mm` can verify it alongside the UI that uses it. Colour-generator luma is a signal level, so a photographic stop is not a doubling of the number: because the display transfer function is a pure power law, scaling emitted light by `2^stops` is scaling luma by `2^(stops / 2.4)`. The self-test pins this against the 75% colour bars, whose six primaries must all resolve to saturation 100% at luma 37.5%, and against an up-then-down stop round trip.
 
 Multiview state is cached independently for every output. A failed SDK getter preserves only that output's last-known value, and successful writes receive a short readback grace period so asynchronous hardware acknowledgement cannot momentarily snap the UI back. Bulk label and border changes execute against one `IBMDSwitcherMultiView` object in a single queue operation and publish one completed snapshot.
 

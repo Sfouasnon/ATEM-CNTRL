@@ -76,6 +76,22 @@ typedef NS_ENUM(NSUInteger, ATEMHyperDeckPlayerState) {
 @property(nonatomic, readonly, getter=isOutput) BOOL output;
 @end
 
+/// One switcher colour generator (Color 1, Color 2, …) in the SDK's HSL model.
+@interface ATEMColorGeneratorState : NSObject
+/// Zero-based position: Color 1 is index 0.
+@property(nonatomic, readonly) NSUInteger index;
+/// SDK input identifier, so the generator can be routed to Program, Preview, or an AUX.
+@property(nonatomic, readonly) int64_t inputID;
+/// Switcher-stored label, e.g. @"Color 1".
+@property(nonatomic, copy, readonly) NSString *name;
+/// Hue in degrees, 0...360.
+@property(nonatomic, readonly) double hue;
+/// Saturation, 0...1.
+@property(nonatomic, readonly) double saturation;
+/// Luma (HSL lightness) as a signal level, 0...1.
+@property(nonatomic, readonly) double luma;
+@end
+
 @interface ATEMKeyState : NSObject
 @property(nonatomic, readonly) NSUInteger index;
 @property(nonatomic, readonly, getter=isOnAir) BOOL onAir;
@@ -228,6 +244,8 @@ typedef NS_ENUM(NSUInteger, ATEMHyperDeckPlayerState) {
 @property(nonatomic, copy, readonly) NSArray<ATEMMultiviewState *> *multiviews;
 /// Every SDK endpoint whose long and short labels can be edited.
 @property(nonatomic, copy, readonly) NSArray<ATEMLabelTargetState *> *labelTargets;
+/// Colour generators reported by the switcher, in SDK input order.
+@property(nonatomic, copy, readonly) NSArray<ATEMColorGeneratorState *> *colorGenerators;
 /// Raw BMDSwitcherVideoMode currently running on the switcher.
 @property(nonatomic, readonly) uint32_t videoMode;
 /// YES when the switcher reports more than one supported video mode.
@@ -264,6 +282,11 @@ typedef NS_ENUM(NSUInteger, ATEMHyperDeckPlayerState) {
 - (void)setAuxOutput:(NSUInteger)index source:(int64_t)sourceID;
 /// Sets the switcher-stored long and short labels for an input or output endpoint.
 - (void)setLabelForInput:(int64_t)inputID longName:(NSString *)longName shortName:(NSString *)shortName;
+/// Sets one colour generator. Hue is in degrees and wraps; saturation and luma clamp to 0...1.
+- (void)setColorGenerator:(NSUInteger)index
+                      hue:(double)hue
+               saturation:(double)saturation
+                     luma:(double)luma;
 /// Changes the switcher-wide video standard. Disruptive: every output re-syncs.
 - (void)setVideoMode:(uint32_t)videoMode;
 - (void)setMultiview:(NSUInteger)index layout:(ATEMMultiviewLayout)layout;

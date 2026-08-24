@@ -6,3 +6,7 @@ DerivedData/
 *.zip
 *.sample.txt
 .DS_Store
+
+# Generated from the locally installed Blackmagic SDK header by `make video-modes`.
+Sources/ATEMVideoModeTable.inc
+__pycache__/
